@@ -55,3 +55,7 @@ Original prompts, prepared inputs, exact outgoing messages, results, stage timin
 
 New endpoints: `/api/v1/harness`, `/api/v1/runs`, `/api/v1/runs/{id}`, `/api/v1/runs/{id}/evaluate`, and `/api/v1/evaluations`.
 External clients authenticate using the server's `HALO_API_TOKEN`; Reactor credentials remain separate.
+
+## Submission and official dev scoring
+
+See [submission workflow](../submission/README.md) for checkpointed harness runs, strict predictions export, the upstream dev scorer, and packaging code plus a short presentation. Local exact-match diagnostics are separate from official judging.
