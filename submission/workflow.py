@@ -184,10 +184,22 @@ def run_benchmark(args):
         checkpoint['run_ids'].update(group_ids)
         checkpoint['completed_histories'][hid]=reactor_history
         atomic_json(checkpoint_path,checkpoint)
-    export_predictions(args.questions,args.histories,checkpoint_path,out/'predictions.jsonl')
+    export_predictions(args.questions,args.histories,checkpoint_path,out/'predictions.jsonl',getattr(args,'citation_fallback',False))
 
 
-def make_predictions(questions,histories,runs):
+def fallback_citations(answer,evidence,allowed,log):
+    """Organiser-sanctioned (2026-10-30): when Reactor's answer has no usable [E#] labels, cite the sessions among the
+    evidence it was sent whose text supports the answer; never the top-ranked one by default. Implemented in
+    src/memory_challenge/reactor/citation_fallback.py (standard library only)."""
+    src=str(ROOT/'src')
+    if src not in sys.path:sys.path.insert(0,src)
+    from memory_challenge.reactor.citation_fallback import choose
+    chosen,record=choose(answer,{'evidence':evidence},allowed)
+    log.append(record)
+    return chosen
+
+
+def make_predictions(questions,histories,runs,citation_fallback=False,fallback_log=None):
     by_id={}
     for run in runs:
         qid=run.get('input',{}).get('question_id')
@@ -229,6 +241,11 @@ def make_predictions(questions,histories,runs):
         if abstain!=bool(result.get('abstained')):raise ValueError('Stored abstention decision inconsistent with Reactor answer')
         answer='' if abstain else strip_labels(result['answer'])
         if not abstain and not answer:raise ValueError('Empty non-abstained answer')
+        if not abstain and not ids and citation_fallback:
+            log=fallback_log if fallback_log is not None else []
+            ids=fallback_citations(answer,evidence,allowed,log)
+            log[-1]['question_id']=q['question_id']
+            if ids:warnings.append(q['question_id']+': citations from supported evidence (fallback): '+', '.join(ids))
         if not abstain and not ids:warnings.append(q['question_id']+': no final-answer citations')
         predictions.append({'question_id':q['question_id'],'abstain':abstain,'answer':answer,'citations':ids})
     return predictions,warnings
@@ -250,7 +267,7 @@ def validate_predictions(predictions,questions,histories):
     return {'valid':True,'questions':len(questions),'predictions':len(predictions),'abstained':sum(p['abstain'] for p in predictions)}
 
 
-def export_predictions(questions_path,histories_path,checkpoint_path,out):
+def export_predictions(questions_path,histories_path,checkpoint_path,out,citation_fallback=False):
     questions,histories=dataset(questions_path,histories_path)
     checkpoint_path=Path(checkpoint_path);checkpoint=json.loads(checkpoint_path.read_text())
     for field,path in [('questions_sha256',questions_path),('histories_sha256',histories_path)]:
@@ -261,11 +278,13 @@ def export_predictions(questions_path,histories_path,checkpoint_path,out):
         run=json.loads((checkpoint_path.parent/'runs'/(rid+'.json')).read_text())
         if run.get('run_id')!=rid or run.get('input',{}).get('question_id')!=qid:raise ValueError('Checkpoint/run identity mismatch')
         runs.append(run)
-    predictions,warnings=make_predictions(questions,histories,runs)
+    fallback_log=[]
+    predictions,warnings=make_predictions(questions,histories,runs,citation_fallback,fallback_log)
     report=validate_predictions(predictions,questions,histories)
     out=Path(out);out.parent.mkdir(parents=True,exist_ok=True)
     temp=out.with_suffix('.tmp');temp.write_text(''.join(json.dumps(p,ensure_ascii=False)+'\n' for p in predictions),encoding='utf-8');temp.replace(out)
-    report.update(warnings=warnings,predictions_sha256=digest(out),run_ids=checkpoint['run_ids'],dataset_fingerprint=checkpoint['fingerprint'])
+    report.update(warnings=warnings,predictions_sha256=digest(out),run_ids=checkpoint['run_ids'],dataset_fingerprint=checkpoint['fingerprint'],
+                  citation_fallback={'enabled':citation_fallback,'decisions':fallback_log})
     atomic_json(out.with_suffix('.validation.json'),report)
     print(json.dumps(report,indent=2));return report
 
@@ -277,7 +296,7 @@ def package(args):
     checkpoint=Path(args.checkpoint)
     import tempfile
     with tempfile.TemporaryDirectory() as folder:
-        report=export_predictions(args.questions,args.histories,checkpoint,Path(folder)/'predictions.jsonl')
+        report=export_predictions(args.questions,args.histories,checkpoint,Path(folder)/'predictions.jsonl',getattr(args,'citation_fallback',False))
         if read_jsonl(Path(folder)/'predictions.jsonl')!=predictions:raise ValueError('Predictions differ from the reproducible Reactor export')
     output=Path(args.out);output.parent.mkdir(parents=True,exist_ok=True)
     paths=[]
@@ -324,6 +343,7 @@ def main():
             p.add_argument('--api-url',default='http://127.0.0.1:8873');p.add_argument('--out',required=True,type=Path)
             p.add_argument('--harness-version',required=True,help='Version or commit of your final harness');p.add_argument('--evidence-mode',choices=['bm25','none'],default='bm25');p.add_argument('--top-k',type=int,default=8);p.add_argument('--max-chars',type=int,default=12000)
         if name in ('export','package'):p.add_argument('--checkpoint',required=True,type=Path);p.add_argument('--out',required=True,type=Path)
+        if name in ('run','export','package'):p.add_argument('--citation-fallback',action='store_true',help='when an answer has no [E#] citation, cite only evidence sessions whose text supports it (organiser-sanctioned; off by default)')
         if name in ('validate','package'):p.add_argument('--predictions',required=True,type=Path)
         if name=='package':p.add_argument('--presentation',required=True,type=Path);p.add_argument('--harness-source',type=Path)
     args=parser.parse_args()
@@ -333,7 +353,7 @@ def main():
         elif args.command=='run':
             if not 1<=args.top_k<=30 or not 2000<=args.max_chars<=14000:raise ValueError('Use top-k 1–30 and max-chars 2000–14000')
             run_benchmark(args)
-        elif args.command=='export':export_predictions(args.questions,args.histories,args.checkpoint,args.out)
+        elif args.command=='export':export_predictions(args.questions,args.histories,args.checkpoint,args.out,args.citation_fallback)
         elif args.command=='validate':print(json.dumps(validate_predictions(read_jsonl(args.predictions),*dataset(args.questions,args.histories)),indent=2))
         elif args.command=='package':package(args)
     except (OSError,ValueError,RuntimeError,KeyError) as e:

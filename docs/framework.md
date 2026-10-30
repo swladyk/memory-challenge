@@ -1,7 +1,8 @@
 # Retrieval framework: how to run it
 
 Code: `src/memory_challenge/` · configs: `configs/` · tests: `tests/` · decisions: `docs/adr-001-retrieval-framework.md`
-· measured results: `docs/framework_results.md`.
+· measured results: `docs/framework_results.md` · team dashboard/workflow integration and `memret harness`:
+`docs/integration.md` · live run: `docs/live_runbook.md`.
 
 Status legend used below: **tested** (unit/integration tests), **measured** (numbers in `docs/framework_results.md`),
 **implemented, not run** (code exists, needs a download or approval), **proposed** (not built).

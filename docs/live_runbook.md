@@ -5,15 +5,19 @@ own terminal** from the `memory-challenge` folder, on branch `feat/retrieval-fra
 
 Budget (organisers, 2026-10-30): one agent per team, questions strictly one at a time, ~50–60 s per answer plus
 15–30 s of internal cycle, ~2.5 h or more for the 146 test questions. Plan **~10 min** for the smoke test and
-**2.5–3.5 h** for the test run. Only one person may use the team's agent at a time: a second user gets `busy`
-refusals or takes over the history (`history_changed`).
+**2.5–3.5 h** for the test run. **Only one person may use the team's agent (t05) at a time**, and every new
+history resets its memory: check with the teammate who shares it, and don't run this while the team dashboard,
+`reactor/smoke_test.py` or `submission/workflow.py run` is talking to Reactor. A second user gets `busy` refusals or
+takes over the history (`history_changed`).
+
+This is runner A in `docs/integration.md`; the team-pipeline alternative (B) is at the end.
 
 ## 0. Prerequisites (you provide or approve)
 
 | What | How |
 | --- | --- |
-| Project-local install of `websockets>=14` (the only dependency of `reactor/client.py`) | `python3 -m venv .venv && .venv/bin/pip install -e '.[reactor]'` (Python 3.11+) |
-| Team base URL and agent id (not secret, from the event handout) | `export REACTOR_BASE_URL=https://tNN.api.reactor-hackathon.rxai.dev REACTOR_AGENT_IDS=agt_...` (one id) |
+| Project-local install of `websockets>=14` and `certifi` (`reactor/requirements.txt`) | `python3 -m venv .venv && .venv/bin/python -m pip install -r reactor/requirements.txt` (Python 3.11+). **Done** in this checkout: websockets 17.4, certifi 2026.10.23 |
+| Team base URL and agent id (not secret; `reactor/LOCAL_SETUP.md`) | `export REACTOR_BASE_URL=https://t05.api.reactor-hackathon.rxai.dev REACTOR_AGENT_IDS=agt_afcb0e0cb62f62db` |
 | Access key | typed by you at a hidden prompt in that terminal, never in chat, a file or a command line: `printf 'Access key: '; read -rs REACTOR_ACCESS_KEY; echo; export REACTOR_ACCESS_KEY` |
 | Keep the Mac awake during the run | prefix the long command with `caffeinate -i` (built into macOS) |
 
@@ -97,3 +101,25 @@ mkdir -p submission
 `submission/predictions.jsonl` is the file to submit, together with the code and a short README
 (`README.md:85-99`). Keep `runs/test-live/` (payloads, attempts log, manifest) as evidence that the predictions came
 from running this code. It is gitignored because it contains conversation text.
+
+## Alternative B: team pipeline with this harness
+
+Same evidence, through the dashboard API (`dashboard/API.md`) and `submission/workflow.py`. The workflow stops at
+the first failed question, and an interrupted history is rerun in full (`docs/integration.md`).
+
+```bash
+# terminal 1: our harness for the test split
+PYTHONPATH=src .venv/bin/python -m memory_challenge harness --split test --port 8890 --out runs/harness-test
+# terminal 2: the dashboard (it holds the key); hidden prompts as in dashboard/API.md
+read -rs 'HALO_API_TOKEN?Choose a local API token: '; export HALO_API_TOKEN
+read -rs 'REACTOR_ACCESS_KEY?Reactor access key: '; export REACTOR_ACCESS_KEY
+HARNESS_URL=http://127.0.0.1:8890/prepare .venv/bin/python dashboard/server.py
+# terminal 3: the run (same HALO_API_TOKEN), then export with the fallback
+caffeinate -i .venv/bin/python submission/workflow.py run --questions test/questions.jsonl \
+    --histories test/histories.jsonl --evidence-mode none --harness-version "$(git rev-parse --short HEAD)" \
+    --citation-fallback --out results/submission
+.venv/bin/python submission/workflow.py export --questions test/questions.jsonl --histories test/histories.jsonl \
+    --checkpoint results/submission/checkpoint.json --citation-fallback --out results/submission/predictions.jsonl
+```
+
+`workflow.py package ... --citation-fallback --harness-source src` builds the team's archive.

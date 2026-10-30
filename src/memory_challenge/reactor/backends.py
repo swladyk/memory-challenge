@@ -40,8 +40,15 @@ class ClientBackend:
     def _run(self, args: list[str]) -> dict:
         cmd = [self.python, str(self.client_path), "--base-url", self.base_url, "--agent-id", self.agent_id,
                "--timeout", str(self.timeout_s), *args]
+        env = os.environ.copy()
+        if "SSL_CERT_FILE" not in env:  # as the team's reactor/smoke_test.py does; TLS verification stays on
+            try:
+                import certifi
+                env["SSL_CERT_FILE"] = certifi.where()
+            except ImportError:
+                pass
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=os.environ.copy(),
+            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env,
                                   timeout=self.timeout_s + 120)
         except subprocess.TimeoutExpired:
             return {"status": "error", "error": "client process did not exit in time", "local_timeout": True}

@@ -234,6 +234,20 @@ def cmd_export(args) -> int:
     return 0 if rep["exit_code"] in (0, 1) else rep["exit_code"]
 
 
+def cmd_harness(args) -> int:
+    from .harness import serve
+    cfg = _cfg(args)
+    out = _out(args.out, f"harness-{cfg.name}-{Path(args.split).name}")
+    server = serve(Path(args.split), cfg, args.host, args.port, out)
+    print(f"halo.harness.v1 harness ({cfg.mode()}, config {cfg.hash()}) for {args.split} on "
+          f"http://{args.host}:{args.port}/prepare · payloads and traces in {out}", file=sys.stderr, flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def cmd_validate(args) -> int:
     from .reactor.predictions import official_score, validate
     v = validate(Path(args.predictions), Path(args.questions), Path(args.histories))
@@ -302,6 +316,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="share of the answer's numbers/content words a passage must contain to be cited (default 0.6)")
     p.add_argument("--max-fallback-sessions", type=int, default=3)
     p.set_defaults(fn=cmd_export)
+    p = sub.add_parser("harness", help="serve this retriever to the team dashboard (halo.harness.v1, POST /prepare)")
+    p.add_argument("--split", required=True, help="split whose histories the dashboard's questions refer to")
+    p.add_argument("--config")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8890)
+    p.add_argument("--out", help="where payloads/traces are written (default: runs/harness-<config>-<split>-<time>)")
+    p.set_defaults(fn=cmd_harness)
     p = sub.add_parser("validate-predictions", help="strict validation (+ official score.py with --gold)")
     p.add_argument("--predictions", required=True)
     p.add_argument("--questions", required=True)
