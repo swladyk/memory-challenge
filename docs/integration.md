@@ -35,7 +35,7 @@ Branch `feat/retrieval-framework`: the framework (commit `79bd0d7`) merged with 
 | --- | --- | --- |
 | Evidence | our retriever (payloads built first) | our retriever (via the harness, per question) |
 | Key held by | the client subprocess, from the terminal's environment | the dashboard server process |
-| On a timeout/closed chat | logged as `ambiguous`, run continues; re-ask later with `--retry-ambiguous` | the workflow stops; rerunning repeats that whole history (all its questions) |
+| On a timeout/closed chat (600 s client wait) | run continues; the late answer is salvaged from the next request, else a drain ping and one re-ask in the same Reactor history | 300 s; the workflow stops; rerunning repeats that whole history (all its questions); late answers not collected |
 | Resume | per question | per completed history |
 | Export | kit `predictions.py` (+ fallback); missing questions reported, file still written | strict: every question must have a completed answer or nothing is exported |
 | Extras | `memret why` traces | dashboard UI, recorded wire messages, zip `package` with code and runs |

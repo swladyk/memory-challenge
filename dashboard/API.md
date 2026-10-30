@@ -150,11 +150,28 @@ curl -sS http://127.0.0.1:8873/api/v1/runs/RUN_ID/evaluate \
   -d '{"reference":{"answer":"June","abstain":false,"evidence":["s_example0002"]}}'
 ```
 
+## Live evaluation logs (read-only)
+
+The Live evaluation view reads the framework's run logs (`run.json`, `events.jsonl`, `stats_history.jsonl`; see
+`docs/framework.md`, "Live logs") from `runs/` or `MEMRET_RUNS_DIR`. Same auth as above; GET only.
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/v1/live/runs` | runs with live logs, newest first: id, kind, status, split, config, total, latest progress |
+| `GET /api/v1/live/runs/{id}` | `run.json` and the latest stats snapshot |
+| `GET /api/v1/live/runs/{id}/events?after=N&limit=M` | event lines after the first N, and `next` (the offset to ask for next) |
+| `GET /api/v1/live/runs/{id}/stats?after=N&limit=M` | stats-history lines the same way; `?tail=N` on either returns the last N lines |
+
+Run ids are paths under the runs folder with `/` written as `~` (`ablation-dev-large~baseline`); anything that would
+leave the folder is a 404. A line still being written is held back until it is complete. `HALO_DASHBOARD_PORT`
+changes the port (default 8873).
+
 ## Validation
 
 ```sh
 node dashboard/test_metrics.cjs
 .venv/bin/python dashboard/test_server.py
+.venv/bin/python dashboard/test_live_api.py
 ```
 
 Integration tests start a real local HTTP harness and dashboard API, but mock Reactor. They check transformations, exact payload capture, credential exclusion, gold isolation, dry runs, scoring, late evaluation, authentication, validation, concurrency rejection, and failure behavior.

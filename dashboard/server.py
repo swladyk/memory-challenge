@@ -5,6 +5,7 @@ from copy import deepcopy
 import json, os, re, secrets, subprocess, sys, threading, time
 import certifi
 import evaluation
+import live_api
 
 ROOT = Path(__file__).resolve().parent.parent
 TOKEN = secrets.token_urlsafe(32)
@@ -150,6 +151,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path=='/api/v1/harness': return self.reply(200,public_harness())
             if self.path=='/api/v1/evaluations': return self.reply(200,summary())
             if self.path=='/api/v1/runs': return self.reply(200,{'runs':all_runs()})
+            if self.path.startswith('/api/v1/live/'): return self.reply(*live_api.handle(self.path))
             if self.path.startswith('/api/v1/runs/'):
                 run = get_run(self.path.removeprefix('/api/v1/runs/'))
                 return self.reply(200,run) if run else self.reply(404,{'error':'Run not found'})
@@ -159,7 +161,7 @@ class Handler(BaseHTTPRequestHandler):
             data['has_server_key']=bool(os.environ.get('REACTOR_ACCESS_KEY'))
             data['example_evidence']=json.loads((ROOT/'reactor/examples/excerpts-example.json').read_text())
             self.reply(200,data)
-        elif self.path in ('/styles.css','/app.js'):
+        elif self.path in ('/styles.css','/app.js','/live.js'):
             self.reply(200,(ROOT/'dashboard'/self.path[1:]).read_text(),'text/css' if self.path.endswith('.css') else 'application/javascript')
         elif self.path=='/': self.reply(200,(ROOT/'dashboard/index.html').read_text().replace('__TOKEN__',TOKEN),'text/html')
         else: self.reply(404,{'error':'Not found'})
@@ -221,6 +223,7 @@ def recover_interrupted():
 
 if __name__=='__main__':
     recover_interrupted()
-    server=ThreadingHTTPServer(('127.0.0.1',8873),Handler)
-    print('Reactor dashboard + evaluation API: http://127.0.0.1:8873',flush=True)
+    port=int(os.environ.get('HALO_DASHBOARD_PORT','8873'))
+    server=ThreadingHTTPServer(('127.0.0.1',port),Handler)
+    print(f'Reactor dashboard + evaluation API: http://127.0.0.1:{port}',flush=True)
     server.serve_forever()

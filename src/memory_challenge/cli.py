@@ -64,14 +64,26 @@ def cmd_build_index(args) -> int:
     return 0
 
 
+def _live_meta(cfg: Config, split: Path, args, command: str) -> dict:
+    return {"command": command, "config": cfg.name, "config_hash": cfg.hash(), "mode": cfg.mode(),
+            "split": split.name, "partition": getattr(args, "partition", "all"), "limit": getattr(args, "limit", None),
+            "workers": getattr(args, "workers", None)}
+
+
 def cmd_retrieve(args) -> int:
-    from .evaluation.runner import run_split
+    from .evaluation.runner import run_split, select_questions
+    from .live import LiveRun, RetrievalTracker
     from .manifest import build_manifest, write_json
     cfg = _cfg(args)
     out = _out(args.out, f"retrieve-{cfg.name}")
     qids = set(args.question_id) if args.question_id else None
-    recs = run_split(Path(args.split), cfg, args.workers, args.partition, args.limit, out, qids)
     split = Path(args.split)
+    total = sum(map(len, select_questions(split, args.partition, args.limit, qids).values()))
+    live = LiveRun(out, "retrieval", _live_meta(cfg, split, args, "retrieve"))
+    tracker = RetrievalTracker(live, total, has_gold=False)
+    recs = run_split(split, cfg, args.workers, args.partition, args.limit, out, qids,
+                     on_records=lambda rs: [tracker.add(r, None) for r in rs])
+    live.finish(questions=len(recs))
     write_json(out / "manifest.json", build_manifest(cfg, {"histories": split / "histories.jsonl",
                                                            "questions": split / "questions.jsonl"},
                                                      {"command": "retrieve", "questions": len(recs)}))
@@ -104,15 +116,39 @@ def cmd_why(args) -> int:
     return 0
 
 
-def _evaluate(split: Path, cfg: Config, args, out: Path | None) -> tuple[dict, list[dict]]:
+def _evaluate(split: Path, cfg: Config, args, out: Path | None, live_dir: Path | None = None,
+              command: str = "evaluate-retrieval") -> tuple[dict, list[dict]]:
+    """Retrieval over a gold split; with ``live_dir``, per-question events and running stats as results arrive.
+    Gold stays in this process: workers never see it."""
     from .data.loader import load_gold
     from .evaluation.metrics import score_record, summarize
-    from .evaluation.runner import run_split
-    t0 = time.perf_counter()
-    recs = run_split(split, cfg, args.workers, args.partition, args.limit, out)
-    wall = time.perf_counter() - t0
+    from .evaluation.runner import run_split, select_questions
+    from .live import LiveRun, RetrievalTracker
     gold = load_gold(split / "gold.jsonl")
-    scored = [score_record(r, gold[r["question_id"]]) for r in recs]
+    scored: list[dict] = []
+    tracker = live = None
+    if live_dir is not None:
+        total = sum(map(len, select_questions(split, args.partition, args.limit).values()))
+        live = LiveRun(live_dir, "retrieval", _live_meta(cfg, split, args, command))
+        tracker = RetrievalTracker(live, total, has_gold=True)
+
+    def on_records(records):
+        for r in records:
+            s = score_record(r, gold[r["question_id"]])
+            scored.append(s)
+            if tracker:
+                tracker.add(r, s)
+
+    t0 = time.perf_counter()
+    try:
+        recs = run_split(split, cfg, args.workers, args.partition, args.limit, out, on_records=on_records)
+    except BaseException:
+        if live:
+            live.finish("failed")
+        raise
+    wall = time.perf_counter() - t0
+    if live:
+        live.finish(questions=len(recs), wall_s=round(wall, 1))
     summary = summarize(scored)
     summary["_run"] = {"config": cfg.name, "config_hash": cfg.hash(), "mode": cfg.mode(), "split": str(split),
                        "partition": args.partition, "limit": args.limit, "questions": len(recs),
@@ -129,7 +165,7 @@ def cmd_evaluate(args) -> int:
         print("evaluate-retrieval needs a split with gold.jsonl (dev or dev-large)", file=sys.stderr)
         return 2
     out = _out(args.out, f"eval-{cfg.name}-{split.name}")
-    summary, scored = _evaluate(split, cfg, args, out if args.save_payloads else None)
+    summary, scored = _evaluate(split, cfg, args, out if args.save_payloads else None, live_dir=out)
     write_json(out / "summary.json", summary)
     (out / "per_question.jsonl").write_text("".join(json.dumps(s) + "\n" for s in scored), encoding="utf-8")
     md = markdown_table(summary, f"{cfg.name} · {cfg.mode()} · {split.name} · {args.partition}")
@@ -150,7 +186,7 @@ def cmd_ablation(args) -> int:
     for path in args.configs:
         try:
             cfg = load_config(path)
-            summary, _ = _evaluate(split, cfg, args, None)
+            summary, _ = _evaluate(split, cfg, args, None, live_dir=out / cfg.name, command="run-ablation")
             rows.append({"config": cfg.name, "mode": cfg.mode(), "hash": cfg.hash(), "summary": summary})
             print(f"{cfg.name}: done ({summary['_run']['wall_s']} s)", flush=True)
         except Exception as exc:  # e.g. an optional model that isn't installed: recorded, not hidden
@@ -179,12 +215,23 @@ def cmd_ablation(args) -> int:
     return 0
 
 
+def _question_order(run: Path) -> list[str] | None:
+    """The split's question order (file order: within a history, the order its questions are asked), from the
+    retrieve run's manifest; None when it can't be found (payloads are then ordered by question id)."""
+    try:
+        path = Path(json.loads((run / "manifest.json").read_text(encoding="utf-8"))["data"]["questions"]["path"])
+        path = path if path.is_absolute() else REPO / path
+        return [json.loads(l)["question_id"] for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def cmd_run_reactor(args) -> int:
     from .reactor.backends import ClientBackend, FakeBackend
     from .reactor.scheduler import load_payloads, run
     cfg = _cfg(args)
     payload_dir = Path(args.payloads) / "payloads" if (Path(args.payloads) / "payloads").exists() else Path(args.payloads)
-    payloads = load_payloads(payload_dir)
+    payloads = load_payloads(payload_dir, _question_order(Path(args.payloads)))
     if not payloads:
         print(f"no payloads in {payload_dir}", file=sys.stderr)
         return 2
@@ -205,8 +252,16 @@ def cmd_run_reactor(args) -> int:
                     for a in agents]
     else:
         backends = [FakeBackend(agent_id=f"agt_fake{i}") for i in range(args.fake_agents)]
-    summary = run(payloads, backends, run_dir, cfg.reactor.retry_refused,
-                  args.retry_ambiguous or cfg.reactor.retry_ambiguous, cfg.reactor.refused_backoff_s)
+    gold = None
+    if args.gold:
+        from .data.loader import load_gold
+        gold = load_gold(Path(args.gold))
+    reask = cfg.reactor.reask_timed_out if args.reask is None else args.reask
+    summary = run(payloads, backends, run_dir, cfg.reactor.retry_refused, cfg.reactor.refused_backoff_s, reask,
+                  cfg.reactor.ping_text, gold=gold,
+                  live_meta={"command": "run-reactor", "backend": args.backend, "config": cfg.name,
+                             "timeout_s": args.timeout or cfg.reactor.timeout_s, "reask": reask},
+                  smoke_check=args.backend == "live")
     print(json.dumps({**summary, "run_dir": str(run_dir), "backend": args.backend}, indent=1))
     return 0
 
@@ -300,10 +355,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--allow-live", action="store_true", help="required for --backend live")
     p.add_argument("--base-url")
     p.add_argument("--agent-id", action="append", help="the team's agent id (each team has one agent)")
-    p.add_argument("--timeout", type=float)
+    p.add_argument("--timeout", type=float, help="seconds the client waits per request (default: reactor.timeout_s, "
+                   "600; Reactor keeps working after it)")
     p.add_argument("--fake-agents", type=int, default=1)
-    p.add_argument("--retry-ambiguous", action="store_true")
+    p.add_argument("--reask", type=int, help="re-asks, in the same Reactor history, of a question that timed out and "
+                   "whose late answer never came (default: reactor.reask_timed_out, 1)")
     p.add_argument("--run-dir")
+    p.add_argument("--gold", help="dev gold.jsonl: grade each answer locally as it arrives (unofficial, live view)")
     p.set_defaults(fn=cmd_run_reactor)
     p = sub.add_parser("export-predictions", help="results.jsonl → predictions.jsonl via the kit's predictions.py")
     p.add_argument("--run", required=True, help="reactor run directory or results.jsonl")

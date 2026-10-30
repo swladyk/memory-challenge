@@ -66,34 +66,33 @@ class Harness(unittest.TestCase):
         lines = (self.root / "run" / "results.jsonl").read_text().splitlines()
         self.assertEqual(len(lines), len({json.loads(l)["question_id"] for l in lines}))
 
-    def test_safe_retry_and_ambiguous_outcomes(self):
-        script = {"q_0_cat": [{"status": "refused", "code": "busy", "forwarded": False}],
-                  "q_1_cat": [{"status": "timeout"}]}
+    def test_safe_retry_of_refusals_never_forwarded(self):
+        script = {"q_0_cat": [{"status": "refused", "code": "busy", "forwarded": False}]}
         run(self.payloads, [FakeBackend("agt_a", script=script)], self.root / "run", retry_refused=1, backoff_s=0)
         acc = checkpoints.accepted(self.attempts(self.root / "run"))
         self.assertEqual(acc["q_0_cat"]["outcome"], "answered")
         self.assertEqual(acc["q_0_cat"]["attempt"], 2)  # never forwarded: retried
-        self.assertEqual(acc["q_1_cat"]["outcome"], "ambiguous")  # may have been delivered: not retried
-        self.assertEqual(acc["q_1_cat"]["attempt"], 1)
-        run(self.payloads, [FakeBackend("agt_b", script={"q_1_cat": [{"status": "timeout"}]})], self.root / "run2",
-            retry_ambiguous=True, backoff_s=0)
-        self.assertEqual(checkpoints.accepted(self.attempts(self.root / "run2"))["q_1_cat"]["attempt"], 2)
 
-    def test_late_final_answer_is_logged_not_taken(self):
+    def test_late_final_answer_is_salvaged_for_its_own_question(self):
         script = {"q_0_cat": [{"status": "timeout"}], "q_0_job": [{"status": "answered", "answer": "a baker [E1]",
                                                                    "citations": [], "abstained": False, "late_for": "q_0_cat"}]}
         run(self.payloads, [FakeBackend("agt_a", script=script)], self.root / "run")
         log = self.attempts(self.root / "run")
-        late = [a for a in log if a.get("kind") == "late_reply"]
-        self.assertEqual(late[0]["for_question"], "q_0_cat")
-        self.assertEqual(checkpoints.accepted(log)["q_0_cat"]["outcome"], "ambiguous")
+        acc = checkpoints.accepted(log)
+        self.assertEqual(acc["q_0_cat"]["outcome"], "answered_late")
+        self.assertEqual(acc["q_0_cat"]["client"]["answer"], "a late answer")
+        self.assertEqual(acc["q_0_cat"]["seen_during"], "q_0_job")
+        timeouts = [a for a in log if a.get("kind") == "ask" and a.get("question_id") == "q_0_cat"
+                    and a["outcome"] == "ambiguous"]
+        self.assertEqual(len(timeouts), 1)  # the timeout attempt stays in the log
 
-    def test_resume_skips_final_and_restarts_history(self):
-        run(self.payloads, [FakeBackend("agt_a", script={"q_2_job": [{"status": "closed"}]})], self.root / "run")
+    def test_resume_skips_final_and_restarts_history_for_another_agent(self):
+        script = {"q_2_job": [{"status": "closed"}, {"status": "closed"}]}  # the re-ask fails too
+        run(self.payloads, [FakeBackend("agt_a", script=script)], self.root / "run")
         second = FakeBackend("agt_b")
         summary = run(self.payloads, [second], self.root / "run")
         self.assertEqual([c for c in second.calls if c[0] == "ask"], [("ask", "q_2_job")])
-        self.assertEqual(second.histories, 1)  # a new Reactor history for the history with questions left
+        self.assertEqual(second.histories, 1)  # agt_a's history isn't agt_b's: a new one for the history left
         self.assertEqual(summary["outcomes"].get("answered"), 6)
 
     def test_mixed_configurations_are_refused(self):
@@ -114,7 +113,7 @@ class Harness(unittest.TestCase):
     def test_export_and_validate_with_the_kit_converter(self):
         script = {"q_0_cat": [{"status": "answered", "answer": "INSUFFICIENT_EVIDENCE", "abstained": True,
                                "citations": [], "unknown_citations": []}],
-                  "q_0_job": [{"status": "timeout"}],
+                  "q_0_job": [{"status": "timeout"}, {"status": "timeout"}],  # the same-history re-ask too
                   "q_1_cat": [{"status": "answered", "answer": "Luna1 [E9]", "abstained": False,
                                "citations": [], "unknown_citations": ["E9"]}]}
         run(self.payloads, [FakeBackend("agt_a", script=script)], self.root / "run")

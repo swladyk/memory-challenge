@@ -28,6 +28,8 @@ class Backend(Protocol):
     def ask(self, history_id: str, question_text: str, question_date: str, evidence_path: Path, question_id: str,
             max_chars: int) -> dict: ...
 
+    def text(self, history_id: str, text: str) -> dict: ...
+
 
 class ClientBackend:
     def __init__(self, client_path: Path, base_url: str, agent_id: str, timeout_s: float, python: str = sys.executable):
@@ -69,8 +71,16 @@ class ClientBackend:
         return self._run(["--history", history_id, "--question", question_text, "--question-date", question_date,
                           "--evidence", str(evidence_path), "--question-id", question_id, "--max-chars", str(max_chars)])
 
+    def text(self, history_id, text) -> dict:
+        """``--text``: a verbatim message (no template, no ref); returns the first reply after it, plus late replies."""
+        return self._run(["--history", history_id, "--text", text])
 
-def _citations(answer: str, passages: list[dict]) -> tuple[list[dict], list[str]]:
+
+_ABSTAINED = re.compile(rf"^\W*{INSUFFICIENT}\b", re.IGNORECASE)  # mirror of client.py's _INSUFFICIENT
+
+
+def citations(answer: str, passages: list[dict]) -> tuple[list[dict], list[str]]:
+    """The official client's ``citations()`` (``[E#]`` labels → the ids of the passages that were sent)."""
     mod = official()
     if mod is not None:
         return mod.citations(answer, passages)
@@ -78,6 +88,26 @@ def _citations(answer: str, passages: list[dict]) -> tuple[list[dict], list[str]
     cited = sorted({int(n) for g in groups for n in re.findall(r"\bE(\d+)\b", g)})
     known = [{"label": f"E{n}", "id": passages[n - 1]["id"]} for n in cited if 1 <= n <= len(passages)]
     return known, [f"E{n}" for n in cited if not 1 <= n <= len(passages)]
+
+
+_citations = citations
+
+
+def abstained(answer: str) -> bool:
+    """The official client's INSUFFICIENT_EVIDENCE check."""
+    mod = official()
+    pattern = getattr(mod, "_INSUFFICIENT", None) if mod is not None else None
+    return bool((pattern or _ABSTAINED).match(answer))
+
+
+def passages_from(evidence_path: Path) -> list[dict]:
+    """The passages exactly as the client loaded them for that question (``load_evidence``), so labels map the same."""
+    raw = Path(evidence_path).read_text(encoding="utf-8")
+    mod = official()
+    if mod is not None and hasattr(mod, "load_evidence"):
+        return mod.load_evidence(raw)
+    return [{"id": e.get("id"), "text": str(e.get("text", "")).strip(), **({"date": e["date"]} if e.get("date") else {})}
+            for e in json.loads(raw)]
 
 
 def default_policy(question: str, passages: list[dict]) -> tuple[str | None, list[int]]:
@@ -94,7 +124,10 @@ def default_policy(question: str, passages: list[dict]) -> tuple[str | None, lis
 class FakeBackend:
     """Imitates reactor/client.py output lines. ``script`` maps question_id → outcomes to return in order before the
     policy answers (e.g. {"status": "timeout"}, {"status": "refused", "code": "busy", "forwarded": False}); an outcome
-    may carry ``late_for`` (a question id whose earlier ref reappears as a late final answer)."""
+    may carry ``late_for`` (a question id whose earlier ref reappears as a late final answer) or ``late: True`` (a
+    timeout whose policy answer arrives as a late final with the next request in the same history, as on Reactor).
+    ``script["__ping__"]`` scripts ``text()`` the same way; ``hold: True`` keeps queued late answers back (not produced
+    yet). A new history drops late answers still queued."""
 
     def __init__(self, agent_id: str = "agt_fake", policy: Callable = default_policy, script: dict | None = None,
                  seed: int = 0):
@@ -107,12 +140,40 @@ class FakeBackend:
         self._lock = threading.Lock()
         self.in_flight = 0
         self.max_in_flight = 0
+        self.queued_late: list[dict] = []
+        self.cycle = 0
 
     def new_history(self) -> dict:
         self.histories += 1
         self.current_history = f"fake-{self.agent_id}-{self.histories}"
+        self.queued_late = []
         self.calls.append(("new_history", self.current_history))
         return {"status": "history", "history_id": self.current_history, "running": True}
+
+    def _drain_late(self) -> list[dict]:
+        late, self.queued_late = self.queued_late, []
+        return late
+
+    def _final(self, question_text: str, passages: list[dict]) -> str:
+        answer, labels = self.policy(question_text, passages)
+        return INSUFFICIENT if answer is None else f"{answer} " + "".join(f"[E{n}]" for n in labels)
+
+    def text(self, history_id, text) -> dict:
+        self.calls.append(("text", text))
+        self.cycle += 1
+        base = {"history_id": history_id, "text": text, "other_replies": [], "late_replies": [], "retries": 0}
+        if history_id != self.current_history:
+            return {**base, "status": "refused", "code": "history_changed", "forwarded": False,
+                    "current_history_id": self.current_history}
+        queued = self.script.get("__ping__")
+        if queued:
+            outcome = dict(queued.pop(0))
+            late_for, hold = outcome.pop("late_for", None), outcome.pop("hold", False)
+            if late_for and late_for in self.refs:
+                self.queued_late.append({"ref": self.refs[late_for], "answer": "a late answer", "cycle": self.cycle})
+            return {**base, **outcome, "late_replies": [] if hold else self._drain_late()}
+        return {**base, "status": "reply", "reply": "OK", "cycle": self.cycle, "latency_s": 0.0,
+                "late_replies": self._drain_late()}
 
     def ask(self, history_id, question_text, question_date, evidence_path, question_id, max_chars) -> dict:
         with self._lock:
@@ -120,6 +181,7 @@ class FakeBackend:
             self.max_in_flight = max(self.max_in_flight, self.in_flight)
         try:
             self.calls.append(("ask", question_id))
+            self.cycle += 1
             ref = f"{self.rng.getrandbits(32):08x}"
             self.refs[question_id] = ref
             base = {"question_id": question_id, "history_id": history_id, "ref": ref, "question": question_text,
@@ -130,21 +192,22 @@ class FakeBackend:
             passages = json.loads(Path(evidence_path).read_text(encoding="utf-8"))
             if len(question_text) + sum(len(p["text"]) for p in passages) > max_chars:
                 return {**base, "status": "error", "error": f"the message is over --max-chars {max_chars}"}
+            base["late_replies"] = self._drain_late()  # an earlier question's final, reported with this request
             queued = self.script.get(question_id)
             if queued:
                 outcome = dict(queued.pop(0))
                 late_for = outcome.pop("late_for", None)
                 if late_for and late_for in self.refs:
-                    base["late_replies"] = [{"ref": self.refs[late_for], "answer": "a late answer", "cycle": 1}]
+                    base["late_replies"] = base["late_replies"] + [
+                        {"ref": self.refs[late_for], "answer": "a late answer", "cycle": self.cycle}]
+                if outcome.pop("late", False):  # Reactor keeps working after the client gives up
+                    self.queued_late.append({"ref": ref, "answer": self._final(question_text, passages),
+                                             "cycle": self.cycle + 1})
                 return {**base, **outcome}
-            answer, labels = self.policy(question_text, passages)
-            if answer is None:
-                final = INSUFFICIENT
-            else:
-                final = f"{answer} " + "".join(f"[E{n}]" for n in labels)
-            cited, unknown = _citations(final, [{"id": p.get("id"), "text": p["text"]} for p in passages])
+            final = self._final(question_text, passages)
+            cited, unknown = citations(final, [{"id": p.get("id"), "text": p["text"]} for p in passages])
             return {**base, "status": "answered", "answer": final, "reply": f"# FINAL ANSWER [ref:{ref}]: {final}",
-                    "cycle": 1, "latency_s": 0.0, "citations": cited, "unknown_citations": unknown,
+                    "cycle": self.cycle, "latency_s": 0.0, "citations": cited, "unknown_citations": unknown,
                     "uncited": bool(passages) and not cited, "abstained": final.startswith(INSUFFICIENT)}
         finally:
             with self._lock:

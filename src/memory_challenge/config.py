@@ -123,10 +123,16 @@ class ReactorConfig:
     client_path: str = "reactor/client.py"
     base_url_env: str = "REACTOR_BASE_URL"  # not secret; read from the environment or passed on the CLI
     agent_ids_env: str = "REACTOR_AGENT_IDS"  # each team has one agent (organisers, 2026-10-30)
-    timeout_s: float = 300.0  # answers take ~50-60 s plus 15-30 s of internal cycle (organisers)
+    # Latency grows as a history accumulates questions (~60 s at first, up to ~200 s, occasionally over 300 s); the
+    # timeout is only how long the client waits, Reactor keeps working (organisers, 2026-10-31: use e.g. 600 s).
+    timeout_s: float = 600.0
     retry_refused: int = 3  # extra attempts after a refusal the server says was never forwarded (busy/previous_pending)
     refused_backoff_s: float = 7.0  # organisers: previous_pending right after an answer is expected; retry after 5-10 s
-    retry_ambiguous: bool = False  # timeouts/closed chats may have been delivered: not retried unless asked
+    # A timed-out question still runs on Reactor: its late final answer is salvaged when a later request in the same
+    # history reports it. Still unanswered when the history's questions are done: one drain ping, then re-asked this
+    # many times in the same Reactor history (organisers, 2026-10-31).
+    reask_timed_out: int = 1
+    ping_text: str = "Reply only OK."
 
 
 @dataclass(frozen=True)

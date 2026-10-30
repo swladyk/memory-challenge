@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from pathlib import Path
 
 from ..config import Config
@@ -74,12 +74,11 @@ def run_history(line: str, questions: list[Question], cfg: Config, out_dir: str 
     return out
 
 
-def run_split(split_dir: Path, cfg: Config, workers: int = 4, partition: str = "all", limit: int | None = None,
-              out_dir: Path | None = None, question_ids: set[str] | None = None) -> list[dict]:
-    paths = SplitPaths(split_dir)
-    paths.check()
+def select_questions(split_dir: Path, partition: str = "all", limit: int | None = None,
+                     question_ids: set[str] | None = None) -> dict[str, list[Question]]:
+    """Questions to run, grouped by history: partition and question-id filters, then an evenly spaced history subset."""
     by_h: dict[str, list[Question]] = {}
-    for q in load_questions(paths.questions):
+    for q in load_questions(SplitPaths(split_dir).questions):
         if question_ids and q.question_id not in question_ids:
             continue
         if partition != "all" and partition_of(q.history_id) != partition:
@@ -89,19 +88,37 @@ def run_split(split_dir: Path, cfg: Config, workers: int = 4, partition: str = "
     if limit and limit < len(hids):  # evenly spaced, so a subset spans every question type (files are type-ordered)
         step = len(hids) / limit
         hids = [hids[int(i * step)] for i in range(limit)]
-    wanted = set(hids)
+    return {h: by_h[h] for h in hids}
+
+
+def run_split(split_dir: Path, cfg: Config, workers: int = 4, partition: str = "all", limit: int | None = None,
+              out_dir: Path | None = None, question_ids: set[str] | None = None, on_records=None) -> list[dict]:
+    """Retrieval for the selected questions. ``on_records(records)`` is called in this process as each history
+    finishes (completion order), so callers can log per question while the run is still going."""
+    paths = SplitPaths(split_dir)
+    paths.check()
+    by_h = select_questions(split_dir, partition, limit, question_ids)
+    wanted = set(by_h)
     results: list[dict] = []
     od = str(out_dir) if out_dir else None
+
+    def take(records: list[dict]) -> None:
+        results.extend(records)
+        if on_records:
+            on_records(records)
+
     if workers <= 1:
         for hid, line in iter_history_lines(paths.histories, wanted):
-            results += run_history(line, by_h[hid], cfg, od)
+            take(run_history(line, by_h[hid], cfg, od))
         return results
     with ProcessPoolExecutor(workers) as pool:
-        futs = []
+        pending = set()
         for hid, line in iter_history_lines(paths.histories, wanted):
-            futs.append(pool.submit(run_history, line, by_h[hid], cfg, od))
-            while sum(not f.done() for f in futs) >= 2 * workers:  # bound the lines held in memory
-                wait([f for f in futs if not f.done()], return_when=FIRST_COMPLETED)
-        for f in futs:
-            results += f.result()
+            pending.add(pool.submit(run_history, line, by_h[hid], cfg, od))
+            if len(pending) >= 2 * workers:  # bound the lines held in memory; log what has finished meanwhile
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for f in done:
+                    take(f.result())
+        for f in as_completed(pending):
+            take(f.result())
     return results

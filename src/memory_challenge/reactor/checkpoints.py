@@ -1,9 +1,10 @@
 """Append-only attempt log and explicit accepted-attempt selection.
 
 Every client result is appended to ``attempts.jsonl`` with who/what/when and an outcome class. ``results.jsonl`` (the
-file ``reactor/predictions.py`` reads) is rewritten from the log with exactly one line per question: the last
-attempt that reached a final state, else the last attempt. Infrastructure failures are never relabelled as
-abstentions here; that is an explicit export policy.
+file ``reactor/predictions.py`` reads) is rewritten from the log with exactly one line per question: a final answer
+received directly, else a late final salvaged from a later request (``answered_late``), else the last attempt; among
+equals the last one. Infrastructure failures are never relabelled as abstentions here; that is an explicit export
+policy.
 """
 from __future__ import annotations
 
@@ -13,12 +14,15 @@ import threading
 import time
 from pathlib import Path
 
-FINAL = {"answered", "reactor_abstained"}
+DIRECT = {"answered", "reactor_abstained"}
+FINAL = DIRECT | {"answered_late"}  # answered_late: a timed-out question's final answer, reported with a later request
 
 
 def classify(result: dict) -> str:
     status = result.get("status")
     if status == "answered":
+        if result.get("late_salvage"):
+            return "answered_late"
         return "reactor_abstained" if result.get("abstained") else "answered"
     if status in ("timeout", "closed"):
         return "ambiguous"  # the question may have reached the agent; the client does not retry these
@@ -55,9 +59,14 @@ class AttemptLog:
         return out
 
 
+def _rank(outcome: str) -> int:
+    return 2 if outcome in DIRECT else 1 if outcome in FINAL else 0
+
+
 def accepted(attempts: list[dict], config_hash: str | None = None) -> dict[str, dict]:
-    """Per question: the last final attempt, else the last attempt. Attempts from another configuration are ignored
-    when ``config_hash`` is given, so different runs are never silently combined."""
+    """Per question: the last direct final answer, else the last salvaged late final, else the last attempt.
+    Attempts from another configuration are ignored when ``config_hash`` is given, so different runs are never
+    silently combined."""
     best: dict[str, dict] = {}
     for a in attempts:
         if a.get("kind") != "ask":
@@ -66,7 +75,7 @@ def accepted(attempts: list[dict], config_hash: str | None = None) -> dict[str, 
             continue
         qid = a["question_id"]
         cur = best.get(qid)
-        if cur is None or a["outcome"] in FINAL or cur["outcome"] not in FINAL:
+        if cur is None or _rank(a["outcome"]) >= _rank(cur["outcome"]):
             best[qid] = a
     return best
 

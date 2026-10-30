@@ -78,6 +78,35 @@ All commands accept `--config configs/<name>.toml` (defaults when omitted). Outp
 `--partition tune|lockbox|all` splits by history id (dev and dev-large share history ids; cued/uncued twins share a
 history), so paired questions stay together. Use `tune` for every decision and `lockbox` rarely.
 
+## Live logs and the Live evaluation view
+
+`evaluate-retrieval`, `run-ablation` (one folder per config), `retrieve` and `run-reactor` write three files into
+their run folder **while they run**, appended, flushed and fsynced per question (`src/memory_challenge/live.py`):
+
+| File | One line per | Holds |
+| --- | --- | --- |
+| `run.json` | run (rewritten atomically) | kind, command, split, config and hash, total, `has_gold`, status `running`/`finished`/`failed` |
+| `events.jsonl` | question event | retrieval: question id, type, hints, passages, chars, latencies, per-question metrics. Reactor: `processed` (sent), `attempt` (will be retried), `evaluated`/`graded` (final), with outcome, latency, retries, citation count, whether the citation fallback would fill it and, with gold, the local grade |
+| `stats_history.jsonl` | event | `progress` {total, processed, evaluated, graded (null without gold), elapsed, ETA, rate}, cumulative metrics per question type, latency percentiles; Reactor runs add outcome counts |
+
+They hold ids, labels and numbers only: no conversation text, answers or keys. The stats history is meant for later
+analysis (for example `pandas.read_json(path, lines=True)`). For Reactor runs give `run-reactor --gold dev/gold.jsonl`
+to grade each final answer with `score.py`'s own functions as it arrives; those scores are local and **unofficial**
+(answers `score.py` can't match exactly are `unjudged`). A resumed run appends to the same files.
+
+To watch a run, start the team dashboard and open **Live evaluation** (`http://127.0.0.1:8873/#live`, or the
+port in `HALO_DASHBOARD_PORT`):
+
+```bash
+.venv/bin/python dashboard/server.py
+```
+
+The view follows the newest run under `runs/` (`MEMRET_RUNS_DIR` to change it) and refreshes once a second: staged
+progress bars (processed / evaluated / graded, each N / total and %, with ETA), the per-type metrics table, charts
+of the stats history and a feed of the latest questions. It reads the files through read-only endpoints behind the
+dashboard's usual auth: `GET /api/v1/live/runs`, `/api/v1/live/runs/{id}`, `/api/v1/live/runs/{id}/events?after=N`
+and `/stats?after=N` (`?tail=N` for the last lines). Nested runs have ids like `ablation-dev-large~baseline`.
+
 ## Configurations
 
 | Config | Mode | Use · measured on dev-large tune (`docs/framework_results.md`) |
@@ -130,15 +159,20 @@ What the organisers said (event channel, 2026-10-30) and how the harness follows
 | Organisers | Harness |
 | --- | --- |
 | Each team has **one** agent; agents process questions sequentially | one agent id; strictly one question at a time; one Reactor history per dataset history, never reset between its questions |
-| An answer takes ~50–60 s, plus 15–30 s to finish the agent's internal cycle; the 146-question benchmark takes ~2.5 h or more | `reactor.timeout_s` 300 s per question; plan ~2.5–3.5 h for test |
+| An answer takes ~50–60 s, plus 15–30 s to finish the agent's internal cycle; the 146-question benchmark takes ~2.5 h or more | plan ~3–6 h for test (latency grows within a history, below) |
+| (2026-10-31) Latency grows as a history accumulates questions (~60 → ~200 s, occasionally > 300 s); "A 300s timeout is the client's waiting limit"; increase `--timeout`, e.g. to 600 s; a client timeout doesn't cancel the question, so check late replies before retrying, and retry in the same Reactor history once the previous request has cleared | `reactor.timeout_s` = 600; late finals are salvaged (`answered_late`); a still-unanswered timeout gets a drain ping, then `reactor.reask_timed_out` = 1 re-ask in the same Reactor history (`reactor/scheduler.py` docstring) |
 | `previous_pending` right after an answer is expected; retry with a 5–10 s backoff | the client retries it within its timeout; if it still comes back, the scheduler waits `refused_backoff_s` = 7 s and retries up to `retry_refused` = 3 more times |
 | "If those labels are missing, your code can select supporting sessions from the retrieved evidence: just make sure they actually support Reactor's answer rather than blindly falling back to the top-ranked result." | `export-predictions --payloads`: supported-citation fallback (below) |
 
-- Re-running the same command resumes: questions with a final answer are skipped; histories with questions left start
-  a new Reactor history (payloads are self-contained). Attempts from another configuration are never combined.
-- Outcomes are kept apart: `answered`, `reactor_abstained` (INSUFFICIENT_EVIDENCE), `ambiguous` (timeout/closed: may
-  have been delivered; not retried unless `--retry-ambiguous`), `not_delivered` (refused before reaching the agent;
-  retried as above), `error`. Late final answers are logged, never taken as current.
+- Re-running the same command resumes: questions with a final answer are skipped; a history with questions left
+  continues in its stored Reactor history, and a new one is started only on `history_changed`, with the reason logged.
+  Attempts from another configuration are never combined. A `history_changed` mid-run (someone else took the agent)
+  stops the run instead of starting a history over theirs.
+- Outcomes are kept apart: `answered`, `reactor_abstained` (INSUFFICIENT_EVIDENCE), `answered_late` (a timed-out
+  question's final answer, reported with a later request in the same history; citations mapped against its own
+  passages with the client's `citations()`), `ambiguous` (timeout/closed, no answer even after the ping and the
+  re-ask), `not_delivered` (refused before reaching the agent; retried as above), `error`. A direct answer outranks a
+  salvaged one, which outranks a timeout.
 - Export uses `--abstain-on agent` only: timeouts and errors are reported as missing, not converted into abstentions.
   Pass `--abstain-on agent,no-answer` deliberately if the team decides otherwise.
 - For `p-budget-32k.toml`, the client is called with `--max-chars` from the payload; only use it once the
