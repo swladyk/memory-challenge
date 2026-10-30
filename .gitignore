@@ -7,9 +7,14 @@ test/
 !reactor/examples/*-example.jsonl
 __pycache__/
 
-# local run artifacts: payloads and traces contain conversation text
+# local environments and secrets
+.venv/
+.env
+.env.*
+
+# local run artifacts: payloads, traces and results contain conversation text
 runs/
+results/
 .cache/
 analysis/out/
-.venv/
 *.egg-info/
