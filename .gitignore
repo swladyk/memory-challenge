@@ -6,3 +6,7 @@ test/
 !uncued_assistant.jsonl
 !reactor/examples/*-example.jsonl
 __pycache__/
+.venv/
+.env
+.env.*
+results/

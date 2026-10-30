@@ -1,0 +1,27 @@
+const fs=require('node:fs'), vm=require('node:vm'), assert=require('node:assert/strict');
+const elements=new Map();
+const element=s=>{if(!elements.has(s))elements.set(s,{value:s==='#filter'?'all':'',innerHTML:'',textContent:'',classList:{toggle(){},add(){},remove(){}},style:{}});return elements.get(s)};
+const context=vm.createContext({document:{querySelector:element,querySelectorAll:()=>[]},console,setTimeout:()=>{},clearTimeout:()=>{},Date});
+const code=fs.readFileSync(__dirname+'/app.js','utf8').replace('bind();render();updateComposer();poll();','');
+vm.runInContext(code,context);
+vm.runInContext(`
+rows=[{question_id:'q1',status:'answered',answer:'June [E2].',citations:[{id:'s2'}],latency_s:10,abstained:false},{question_id:'q2',status:'answered',answer:'INSUFFICIENT_EVIDENCE',citations:[],latency_s:20,abstained:true}];
+gold=[{question_id:'q1',answer:'June',abstain:false,evidence:['s2']},{question_id:'q2',answer:'unknown',abstain:true,evidence:[]},{question_id:'missing',answer:'July',abstain:false,evidence:['s3']}];render();`,context);
+assert.match(element('#goldmetrics').innerHTML,/50%/);
+assert.match(element('#goldmetrics').innerHTML,/0.500/);
+assert.match(element('#goldmetrics').innerHTML,/67%/);
+assert.match(element('#stats').innerHTML,/15.0/);
+assert.match(element('#stats').innerHTML,/100%/);
+assert.throws(()=>vm.runInContext(`validateImport([{question_id:'q1',status:'answered'}],false,rows)`,context),/Duplicate/);
+assert.throws(()=>vm.runInContext(`validateImport([{question_id:'q3',status:'answered',citations:[null]}],false,rows)`,context),/valid citations/);
+vm.runInContext(`detailTab='evidence';renderDetail()`,context);
+assert.match(element('#conversation').innerHTML,/wasn’t saved/);
+vm.runInContext(`detailTab='trace';renderDetail()`,context);
+assert.match(element('#conversation').innerHTML,/Request diagnostics/);
+vm.runInContext(`detailTab='raw';renderDetail()`,context);
+assert.match(element('#conversation').innerHTML,/Copy JSON/);
+vm.runInContext(`rows=[];gold=[];render()`,context);
+assert.doesNotMatch(element('#stats').innerHTML,/NaN|Infinity/);
+assert.match(element('#goldmetrics').innerHTML,/—/);
+assert.equal(vm.runInContext(`esc('<img src=x onerror=alert(1)>')`,context),'&lt;img src=x onerror=alert(1)&gt;');
+console.log('Passed: metrics, missing predictions, import validation, evidence/diagnostics/JSON tabs, empty states, HTML escaping.');
