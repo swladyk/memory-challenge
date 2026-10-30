@@ -1,0 +1,7 @@
+# Ablation H: graph expansion + Personalized PageRank as an extra fusion source for aggregation/temporal/update plans.
+# A local, HippoRAG-inspired experiment, not a HippoRAG 2 reproduction (no OpenIE, synonym edges or LLM filter).
+name = "h-ppr"
+[graph]
+enabled = true
+[ppr]
+enabled = true

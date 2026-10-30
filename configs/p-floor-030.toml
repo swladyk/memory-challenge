@@ -1,0 +1,4 @@
+# Packing trade-off: a lower strength floor packs more (higher recall, lower precision, longer messages).
+name = "p-floor-030"
+[packing]
+score_floor = 0.3

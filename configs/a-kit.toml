@@ -1,0 +1,3 @@
+# Ablation A: the supplied keyword baseline (reactor/examples/run_benchmark.py:34-46), re-implemented.
+name = "a-kit"
+retriever = "kit"

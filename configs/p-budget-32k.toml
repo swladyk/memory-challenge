@@ -1,0 +1,6 @@
+# Packing at the server's current limit (32,000 characters; reactor/PARTICIPANTS.md:119-120). Use with
+# run-reactor only if the organisers confirm the limit: the client must then get --max-chars 32000.
+name = "p-budget-32k"
+[packing]
+max_message_chars = 32000
+max_sessions = 20

@@ -1,0 +1,6 @@
+# Ablation B: windows + BM25 + packing, without per-component search or the recovery round.
+name = "b-lexical-windows"
+[lexical]
+per_component = false
+[controller]
+recovery = false

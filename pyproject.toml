@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memory-challenge"
+version = "0.1.0"
+description = "Retrieval framework for the Memory Retrieval Challenge: windows, BM25, graph expansion, packing, Reactor harness."
+requires-python = ">=3.11"
+dependencies = []  # the baseline is standard library only
+
+[project.optional-dependencies]
+reactor = ["websockets>=14"]                       # needed only to call Reactor through reactor/client.py
+dense = ["numpy>=1.24", "sentence-transformers>=2.7"]  # optional dense retrieval and cross-encoder reranking
+dev = ["pytest>=7"]
+
+[project.scripts]
+memret = "memory_challenge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

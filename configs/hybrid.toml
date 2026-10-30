@@ -1,0 +1,13 @@
+# Optional hybrid: BM25 + dense bi-encoder (RRF) + cross-encoder rerank + graph. Needs the [dense] extra and model
+# downloads (~130 MB embedder, ~90 MB cross-encoder): see docs/framework.md "Optional models". Not run by default.
+name = "hybrid"
+[dense]
+enabled = true
+model_id = "BAAI/bge-small-en-v1.5"
+revision = "main"
+[rerank]
+enabled = true
+model_id = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+revision = "main"
+[graph]
+enabled = true

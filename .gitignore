@@ -6,3 +6,10 @@ test/
 !uncued_assistant.jsonl
 !reactor/examples/*-example.jsonl
 __pycache__/
+
+# local run artifacts: payloads and traces contain conversation text
+runs/
+.cache/
+analysis/out/
+.venv/
+*.egg-info/

@@ -1,0 +1,4 @@
+# Baseline + attribute query expansion (age -> years old, born; how long -> since, started; ...).
+name = "b2-attribute-expansion"
+[lexical]
+expand_attributes = true

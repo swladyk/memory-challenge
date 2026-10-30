@@ -1,0 +1,4 @@
+# Ablation G (reverse): baseline without the soft boost for sessions inside the question's time range.
+name = "g-no-time-boost"
+[controller]
+time_boost = 0.0

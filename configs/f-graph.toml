@@ -1,0 +1,5 @@
+# Ablation F: baseline + bounded structural graph expansion (NEXT/PREV, list items for position questions,
+# entity mentions named in the question), depth <= 2, <= 30 added windows.
+name = "f-graph"
+[graph]
+enabled = true
