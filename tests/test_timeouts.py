@@ -174,5 +174,20 @@ class Timeouts(unittest.TestCase):
         self.assertEqual(summary["outcomes"], {"answered": 4, "answered_late": 1, "error": 1})
 
 
+class AccessKeyShape(unittest.TestCase):
+    """Made-up test values only: the check runs before any request and never prints the key."""
+
+    def test_paste_markers_and_whitespace_are_removed(self):
+        from memory_challenge.cli import _access_key_problem
+        env = {"REACTOR_ACCESS_KEY": "\x1b[200~rxk_testvalue123\x1b[201~\n"}
+        self.assertIsNone(_access_key_problem(env))
+        self.assertEqual(env["REACTOR_ACCESS_KEY"], "rxk_testvalue123")
+
+    def test_malformed_keys_are_refused(self):
+        from memory_challenge.cli import _access_key_problem
+        for bad in ("", "   ", "rxk_test value", "rxk_t\x07est", "rxk_tést", "halo-api-token-123"):
+            self.assertIsNotNone(_access_key_problem({"REACTOR_ACCESS_KEY": bad}), repr(bad))
+
+
 if __name__ == "__main__":
     unittest.main()

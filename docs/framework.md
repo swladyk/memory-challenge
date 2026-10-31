@@ -107,6 +107,36 @@ of the stats history and a feed of the latest questions. It reads the files thro
 dashboard's usual auth: `GET /api/v1/live/runs`, `/api/v1/live/runs/{id}`, `/api/v1/live/runs/{id}/events?after=N`
 and `/stats?after=N` (`?tail=N` for the last lines). Nested runs have ids like `ablation-dev-large~baseline`.
 
+## Comparing with the kit baseline
+
+`compare` puts systems side by side on the same questions with score.py's own `validate`, `score_question` and
+`summarize`: per-type scores with deltas against a reference, a per-question answer transition table (correct /
+unjudged / wrong / abstained / missing), evidence-F1 wins and losses, and paired bootstrap 95% intervals. Given
+payload directories it also compares what each system sent (gold sessions in the packed evidence, passages, message
+size), which needs no Reactor run. The gold file must hold exactly the compared questions: score.py counts a missing
+prediction as wrong.
+
+```bash
+.venv/bin/python -m memory_challenge compare --gold G --reference kit \
+    --system kit=kit/predictions.jsonl --system ours=ours/predictions.jsonl \
+    --payloads kit=runs/kit --payloads ours=runs/ours --out runs/compare
+```
+
+Ready-made for a scorable live comparison: 40 dev-large lockbox questions (never used for tuning; 4 unanswerable),
+evidence built by both systems in `runs/dev-live` (ours, `configs/baseline.toml`) and `runs/dev-live-kit` (the kit's
+`run_benchmark.py` retriever, `configs/a-kit.toml`), each with `gold.subset.jsonl`:
+
+```bash
+bash scripts/start_dev_eval_run.sh kit     # live, ~60-80 min each; needs agent t05 free
+bash scripts/start_dev_eval_run.sh         # ours
+bash scripts/score_dev_eval_run.sh kit && bash scripts/score_dev_eval_run.sh   # export, validate, score.py
+bash scripts/compare_dev_runs.sh           # report in runs/dev-compare/reactor-live/comparison.md
+```
+
+`correct` from score.py is a lower bound (the official LLM judge decides `unjudged` answers); evidence F1 and
+abstention are exact. Retrieval only, all 163 lockbox questions (`run-ablation --partition lockbox`): complete gold
+evidence packed 0.401 (kit) vs 0.836 (ours), gold recall 0.533 vs 0.898, precision 0.290 vs 0.363.
+
 ## Configurations
 
 | Config | Mode | Use · measured on dev-large tune (`docs/framework_results.md`) |

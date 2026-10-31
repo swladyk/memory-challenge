@@ -215,6 +215,32 @@ def cmd_ablation(args) -> int:
     return 0
 
 
+_PASTE_MARKERS = ("\x1b[200~", "\x1b[201~")  # bracketed paste: some terminals wrap pasted text in these
+
+
+def _access_key_problem(env: dict) -> str | None:
+    """Checks the shape of REACTOR_ACCESS_KEY before anything is sent; never prints the key. Paste markers and
+    surrounding whitespace are removed in place (the client inherits ``env``). Returns what is wrong, or None."""
+    key = env.get("REACTOR_ACCESS_KEY", "")
+    clean = key
+    for marker in _PASTE_MARKERS:
+        clean = clean.replace(marker, "")
+    clean = clean.strip()
+    if clean != key:
+        env["REACTOR_ACCESS_KEY"] = clean
+        print("note: removed paste markers or surrounding whitespace from REACTOR_ACCESS_KEY (the key is never "
+              "printed)", file=sys.stderr)
+    if not clean:
+        return "REACTOR_ACCESS_KEY is empty: enter the key at the hidden prompt"
+    if not clean.isascii() or not clean.isprintable() or any(c.isspace() for c in clean):
+        return ("REACTOR_ACCESS_KEY contains spaces, control or non-ASCII characters (often a paste artefact): "
+                "enter it again at the hidden prompt")
+    if not clean.startswith("rxk_"):
+        return ("REACTOR_ACCESS_KEY doesn't start with rxk_, the access key's documented prefix "
+                "(reactor/PARTICIPANTS.md:7): is it the Reactor access key?")
+    return None
+
+
 def _question_order(run: Path) -> list[str] | None:
     """The split's question order (file order: within a history, the order its questions are asked), from the
     retrieve run's manifest; None when it can't be found (payloads are then ordered by question id)."""
@@ -243,6 +269,10 @@ def cmd_run_reactor(args) -> int:
         if not os.environ.get("REACTOR_ACCESS_KEY"):
             print("set REACTOR_ACCESS_KEY at a hidden prompt first (reactor/PARTICIPANTS.md, step 2)", file=sys.stderr)
             return 2
+        problem = _access_key_problem(os.environ)
+        if problem:
+            print(f"refusing to call Reactor: {problem}", file=sys.stderr)
+            return 2
         base = args.base_url or os.environ.get(cfg.reactor.base_url_env)
         agents = args.agent_id or [a for a in os.environ.get(cfg.reactor.agent_ids_env, "").split(",") if a]
         if not base or not agents:
@@ -263,6 +293,32 @@ def cmd_run_reactor(args) -> int:
                              "timeout_s": args.timeout or cfg.reactor.timeout_s, "reask": reask},
                   smoke_check=args.backend == "live")
     print(json.dumps({**summary, "run_dir": str(run_dir), "backend": args.backend}, indent=1))
+    return 0
+
+
+def _labelled(items: list[str] | None, what: str) -> dict[str, Path]:
+    out = {}
+    for item in items or []:
+        label, sep, path = item.partition("=")
+        if not sep or not label or not path:
+            raise SystemExit(f"{what} must be LABEL=PATH, got {item!r}")
+        out[label] = Path(path)
+    return out
+
+
+def cmd_compare(args) -> int:
+    from .compare import compare, markdown
+    report = compare(Path(args.gold), _labelled(args.system, "--system"), _labelled(args.payloads, "--payloads"),
+                     args.reference)
+    md = markdown(report)
+    if args.out:
+        out = Path(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "comparison.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
+        (out / "comparison.md").write_text(md, encoding="utf-8")
+    print(md if args.per_question else md.split("\n## Per question")[0])
+    if args.out:
+        print(f"written to {Path(args.out) / 'comparison.md'} and comparison.json")
     return 0
 
 
@@ -363,6 +419,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--run-dir")
     p.add_argument("--gold", help="dev gold.jsonl: grade each answer locally as it arrives (unofficial, live view)")
     p.set_defaults(fn=cmd_run_reactor)
+    p = sub.add_parser("compare", help="compare systems on the same questions with score.py (e.g. kit baseline vs ours)")
+    p.add_argument("--gold", required=True, help="gold for exactly the compared questions (missing predictions = wrong)")
+    p.add_argument("--system", action="append", help="LABEL=predictions.jsonl (repeat); the first is the reference")
+    p.add_argument("--payloads", action="append", help="LABEL=retrieve run dir: compare what each system sent")
+    p.add_argument("--reference", help="the label the others are compared against (default: the first)")
+    p.add_argument("--out", help="directory for comparison.md and comparison.json")
+    p.add_argument("--per-question", action="store_true", help="also print the per-question table")
+    p.set_defaults(fn=cmd_compare)
     p = sub.add_parser("export-predictions", help="results.jsonl → predictions.jsonl via the kit's predictions.py")
     p.add_argument("--run", required=True, help="reactor run directory or results.jsonl")
     p.add_argument("--histories", required=True)
