@@ -109,50 +109,65 @@ class Timeouts(unittest.TestCase):
         self.assertEqual((meta["status"], last["progress"]["evaluated"], last["progress"]["failures"]),
                          ("finished", 6, 1))
 
-    def test_resume_continues_the_stored_reactor_history(self):
+    def test_resume_starts_a_new_history_from_the_first_question_never_the_stale_id(self):
         agent = FakeBackend("agt_a", script={"q_2_job": [{"status": "error", "error": "client crashed"}]})
         self.run_with(agent)
         self.assertEqual(agent.histories, 3)
+        old_ids = {a["reactor_history_id"] for a in self.log() if a.get("kind") == "new_history"}
         agent.calls.clear()
-        summary = self.run_with(agent)  # same agent, still on the last dataset history's Reactor history
-        self.assertEqual(agent.calls, [("ask", "q_2_job")])  # no new history
+        summary = self.run_with(agent)  # even though fake-agt_a-3 is still the agent's current history
+        self.assertEqual(agent.calls, [("new_history", "fake-agt_a-4"), ("ask", "q_2_cat"), ("ask", "q_2_job")])
         self.assertEqual(summary["outcomes"].get("answered"), 6)
-        reuse = [a for a in self.log() if a.get("kind") == "history_reuse"]
-        self.assertEqual((len(reuse), reuse[0]["reactor_history_id"]), (1, "fake-agt_a-3"))
-        got = checkpoints.accepted(self.log())["q_2_job"]
-        self.assertEqual((got["attempt"], got["reactor_history_id"]), (2, "fake-agt_a-3"))
+        self.assertIsNone(summary["stopped"])
+        run2 = [a for a in self.log() if a.get("run_id") == summary["run_id"]]
+        self.assertFalse({a.get("reactor_history_id") for a in run2 if a.get("kind") == "ask"} & old_ids)
+        nh = [a for a in run2 if a.get("kind") == "new_history"][0]
+        self.assertIn("never reused", nh["reason"])
+        acc = checkpoints.accepted(self.log())
+        self.assertEqual({acc[q]["reactor_history_id"] for q in ("q_2_cat", "q_2_job")}, {"fake-agt_a-4"})
+        self.assertEqual(acc["q_2_job"]["attempt"], 2)  # attempt numbers continue across runs
 
-    def test_resume_salvages_an_earlier_runs_timeout_in_the_stored_history(self):
-        agent = FakeBackend("agt_a", script={"q_2_job": [{"status": "timeout", "late": True}],
-                                             "__ping__": [{"status": "timeout", "hold": True}]})  # not produced yet
-        self.run_with(agent, reask=0)
+    def test_resume_asks_an_earlier_runs_timeout_again_in_the_new_history(self):
+        agent = FakeBackend("agt_a", script={"q_2_job": [{"status": "timeout"}, {"status": "timeout"}]})
+        self.run_with(agent)
         self.assertEqual(checkpoints.accepted(self.log())["q_2_job"]["outcome"], "ambiguous")
         agent.calls.clear()
-        self.run_with(agent)  # the late final comes with the next request in that history
-        got = checkpoints.accepted(self.log())["q_2_job"]
-        self.assertEqual(got["outcome"], "answered")  # this run's own answer outranks the salvaged one
-        salvaged = [a for a in self.log() if a.get("salvaged")]
-        self.assertEqual([a["question_id"] for a in salvaged], ["q_2_job"])
-        self.assertEqual(agent.histories, 3)
+        summary = self.run_with(agent)
+        self.assertEqual(agent.calls, [("new_history", "fake-agt_a-4"), ("ask", "q_2_cat"), ("ask", "q_2_job")])
+        self.assertEqual(summary["outcomes"], {"answered": 6})
 
-    def test_history_changed_on_resume_starts_a_new_history_and_logs_why(self):
+    def test_another_users_reset_between_runs_needs_no_request_with_the_old_id(self):
         agent = FakeBackend("agt_a", script={"q_2_job": [{"status": "error", "error": "client crashed"}]})
         self.run_with(agent)
-        agent.new_history()  # someone else used the agent in between: our stored history is gone
+        agent.new_history()  # someone else used the agent in between
         agent.calls.clear()
         summary = self.run_with(agent)
-        self.assertEqual(agent.calls, [("ask", "q_2_job"), ("new_history", "fake-agt_a-5"), ("ask", "q_2_job")])
+        self.assertEqual(agent.calls, [("new_history", "fake-agt_a-5"), ("ask", "q_2_cat"), ("ask", "q_2_job")])
         self.assertEqual(summary["outcomes"].get("answered"), 6)
-        nh = [a for a in self.log() if a.get("kind") == "new_history"][-1]
-        self.assertEqual(nh["previous_reactor_history_id"], "fake-agt_a-3")
-        self.assertIn("history_changed", nh["reason"])
+        self.assertFalse([a for a in self.log() if a.get("code") == "history_changed"])
 
-    def test_history_changed_mid_run_stops_instead_of_resetting_someone_elses_history(self):
+    def test_history_replaced_mid_run_restarts_the_dataset_history_from_its_first_question(self):
         taken = {"status": "refused", "code": "history_changed", "forwarded": False, "current_history_id": "theirs"}
         agent = FakeBackend("agt_a", script={"q_0_job": [taken]})
         summary = self.run_with(agent)
-        self.assertEqual(agent.histories, 1)
-        self.assertIn("another process", summary["stopped"])
+        h0 = agent.calls[:agent.calls.index(("new_history", "fake-agt_a-3"))]
+        self.assertEqual(h0, [("new_history", "fake-agt_a-1"), ("ask", "q_0_cat"), ("ask", "q_0_job"),
+                              ("new_history", "fake-agt_a-2"), ("ask", "q_0_cat"), ("ask", "q_0_job")])
+        self.assertIsNone(summary["stopped"])
+        self.assertEqual(summary["outcomes"], {"answered": 6})
+        nh = [a for a in self.log() if a.get("kind") == "new_history"][1]
+        self.assertEqual(nh["previous_reactor_history_id"], "fake-agt_a-1")
+        self.assertIn("restarting this dataset history from its first question", nh["reason"])
+        acc = checkpoints.accepted(self.log())
+        self.assertEqual({acc[q]["reactor_history_id"] for q in ("q_0_cat", "q_0_job")}, {"fake-agt_a-2"})
+
+    def test_repeated_replacement_stops_after_the_allowed_restarts(self):
+        taken = {"status": "refused", "code": "history_changed", "forwarded": False, "current_history_id": "theirs"}
+        agent = FakeBackend("agt_a", script={"q_0_job": [taken, taken, taken]})
+        summary = self.run_with(agent, max_restarts=2)
+        self.assertEqual(agent.histories, 3)  # the first, then 2 restarts; no third reset of the agent
+        self.assertEqual([c for c in agent.calls if c == ("ask", "q_0_job")], [("ask", "q_0_job")] * 3)
+        self.assertIn("keeps resetting", summary["stopped"])
         self.assertEqual([a["kind"] for a in self.log()].count("stopped"), 1)
         self.assertEqual(json.loads((self.run_dir / "run.json").read_text())["status"], "stopped")
 

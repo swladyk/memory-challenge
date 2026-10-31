@@ -17,11 +17,16 @@ Refusals: the client already retries refusals the server says were never forward
 backing off 1-8 s within its timeout. If it still returns one, the scheduler waits ``backoff_s`` (7 s: organisers
 suggest 5-10 s) and asks again, up to ``retry_refused`` (3) more times.
 
-Resume. The log keeps each dataset history's Reactor history id. On resume, questions with a final answer are skipped
-and a dataset history with questions left continues in its stored Reactor history (timeouts from the earlier run can
-still be salvaged there). Only when the server answers ``history_changed`` (the agent has moved to another history
-since) is a new Reactor history started, and the reason is logged. A ``history_changed`` in the middle of a run means
-another process took the agent over: that agent stops rather than reset someone else's history.
+Replaced histories (organisers, 2026-10-31: "In case a history was replaced mid-run, restart that dataset history
+from the beginning rather than retrying with the stale ID"). On ``history_changed`` the scheduler starts a new Reactor
+history and asks that dataset history again from its first question, answered ones included; later direct answers
+replace earlier ones. If the same dataset history is replaced more than ``max_restarts`` (2) times in a run, another
+process keeps resetting the agent: the agent stops instead of resetting it again. Run one benchmark process at a time.
+
+Resume. Dataset histories whose questions all have a final answer are skipped. One with questions left gets a new
+Reactor history and is asked again from its first question, answered ones included: a Reactor history id from an
+earlier run is never used again (organisers: never retry with a stale id). Every new history logs why it was
+started, and every request is in ``requests.jsonl`` (live runs).
 
 Smoke check (``smoke_check``, on for live runs): the run's first question doubles as the connection check. If its
 history cannot be opened, or it ends in an error or refusal rather than an answer or a timeout (wrong URL, key or
@@ -85,11 +90,11 @@ class _Agent:
         self.b, self.ctx = backend, ctx
         self.log, self.tracker, self.run_id = ctx["log"], ctx["tracker"], ctx["run_id"]
         self.rh: str | None = None
-        self.reused = False  # continuing a stored history: history_changed then means "gone", not "taken over"
-        self.confirmed = False  # the server has accepted a request in self.rh during this run
         self.pending: dict[str, dict] = {}  # ref → timed-out ask still waiting for its late final
         self.refs: dict[str, str] = {}  # ref → question id, every ask by this agent (for logging stray late finals)
         self.stopped = False
+        self.replaced: dict | None = None  # the history_changed reply that ended the current Reactor history
+        self.final_here: set[str] = set()  # questions answered in the current Reactor history
 
     def rec(self, record: dict) -> None:
         self.log.append({"run_id": self.run_id, "agent_id": self.b.agent_id, **record})
@@ -104,7 +109,8 @@ class _Agent:
             if not self.ctx["smoke"]["passed"] and self.ctx["smoke"]["enabled"]:
                 self.stop(hid, nh, f"smoke check: the first new history failed ({nh.get('error') or nh.get('status')})")
             return False
-        self.rh, self.reused, self.confirmed = nh["history_id"], False, False
+        self.rh = nh["history_id"]
+        self.final_here = set()
         if self.pending:  # a new history wipes late replies: those answers can no longer arrive
             self.rec({"kind": "late_dropped", "dataset_history_id": hid, "refs": sorted(self.pending),
                       "questions": sorted({p["question_id"] for p in self.pending.values()}),
@@ -112,17 +118,12 @@ class _Agent:
             self.pending = {}
         return True
 
-    def start(self, hid: str, ps: list[dict]) -> bool:
-        stored = self.ctx["stored"].get((hid, self.b.agent_id))
+    def start(self, hid: str, ps: list[dict], resumed: bool) -> bool:
+        """A new Reactor history for this dataset history, always: an id from an earlier run is never reused."""
         self.pending = {}
-        if stored:
-            self.rh, self.reused, self.confirmed = stored, True, False
-            self.pending = {r: pend for r, pend in self.ctx["timed_out"].get(stored, {}).items()
-                            if pend["question_id"] not in self.ctx["final"]}
-            self.rec({"kind": "history_reuse", "dataset_history_id": hid, "reactor_history_id": stored,
-                      "pending_late": sorted(self.pending), "note": "resume: continuing the stored Reactor history"})
-            return True
-        if self.open_history(hid, "first questions of this dataset history in this run directory"):
+        why = ("resume: a new Reactor history, asking this dataset history again from its first question (an earlier "
+               "run's Reactor history id is never reused)" if resumed else "first questions of this dataset history")
+        if self.open_history(hid, why):
             return True
         for p in ps:  # no history: every question of this dataset history fails, logged as such
             res = {"status": "error", "question_id": p["question_id"], "error": "new history failed"}
@@ -155,6 +156,7 @@ class _Agent:
 
     def mark_final(self, qid: str) -> None:
         self.ctx["final"].add(qid)
+        self.final_here.add(qid)
         for r in [r for r, pend in self.pending.items() if pend["question_id"] == qid]:
             del self.pending[r]
 
@@ -168,12 +170,12 @@ class _Agent:
                   "reactor_latency_s": res.get("latency_s"), "wall_s": round(wall, 3)})
         self.tracker.ping_event(hid, reason, res.get("status"), n, wall)
         if res.get("code") == "history_changed":
-            self.stop(hid, res)
+            self.replaced = res
             return
         self.collect_late(res, hid, None, "ping")
 
-    TAKEN_OVER = ("history_changed during the run: another process is using this agent; not starting a new history "
-                  "over it. Resume when the agent is free.")
+    TAKEN_OVER = ("history_changed again after the allowed restarts: another process keeps resetting this agent; "
+                  "not resetting it again. Run one benchmark process at a time, then resume.")
 
     def stop(self, hid: str, res: dict, reason: str = TAKEN_OVER) -> None:
         self.stopped = True
@@ -210,20 +212,10 @@ class _Agent:
                       "status": res.get("status"), "code": res.get("code"), "client_retries": res.get("retries"),
                       "reactor_latency_s": res.get("latency_s"), "wall_s": round(wall, 3), "payload_sha": payload_sha,
                       "config_hash": self.ctx["config_hash"], "client": res})
-            if gone:
-                if self.reused and not self.confirmed:  # the stored history is no longer the agent's: start anew
-                    self.tracker.result_event(qid, hid, attempt, res, outcome, wall, None, final=False)
-                    old = self.rh
-                    if self.open_history(hid, f"stored Reactor history {old} was replaced (history_changed, agent now "
-                                              f"on {res.get('current_history_id')}): QUICKSTART allows a new one",
-                                         previous=old):
-                        continue
-                    self.tracker.result_event(qid, hid, attempt, res, "error", wall, None, final=True)
-                    return attempt
-                self.stop(hid, res)
-                self.tracker.result_event(qid, hid, attempt, res, outcome, wall, None, final=True)
+            if gone:  # never retried with the stale id: run_history restarts the dataset history in a new one
+                self.tracker.result_event(qid, hid, attempt, res, outcome, wall, None, final=False)
+                self.replaced = res
                 return attempt
-            self.confirmed = True
             if outcome in FINAL:
                 self.mark_final(qid)
             elif qid in self.ctx["final"]:  # this attempt failed, but its earlier attempt's late final just arrived
@@ -258,49 +250,66 @@ class _Agent:
                     out[pend["question_id"]] = pend
         return out
 
-    def run_history(self, hid: str, ps: list[dict]) -> None:
-        if not self.start(hid, ps):
+    def run_history(self, hid: str, everything: list[dict]) -> None:
+        """All of a dataset history's questions (``everything``, in order), always in a new Reactor history and from the
+        first question; a replaced history restarts the same way, never retried with its stale id."""
+        left = [p for p in everything if p["question_id"] not in self.ctx["final"]]
+        resumed = len(left) < len(everything) or any(p["question_id"] in self.ctx["attempts"] for p in everything)
+        if not self.start(hid, left, resumed):
             return
-        attempts = self.ctx["attempts"]
-        for p in ps:
-            if self.stopped:
+        restarts = 0
+        while True:
+            self.replaced = None
+            self.ask_all(hid, everything)
+            if self.stopped or not self.replaced:
                 return
-            if p["question_id"] in self.ctx["final"]:  # salvaged meanwhile (a resumed history's late final)
+            res, old = self.replaced, self.rh
+            restarts += 1
+            if restarts > self.ctx["max_restarts"]:
+                self.stop(hid, res)
+                return
+            why = f"Reactor history {old} was replaced (history_changed, agent now on " \
+                  f"{res.get('current_history_id')}): restarting this dataset history from its first question"
+            if not self.open_history(hid, why, previous=old):
+                self.stop(hid, res, f"history_changed, then a new history failed for {hid}")
+                return
+
+    def ask_all(self, hid: str, todo: list[dict]) -> None:
+        """One pass in the current Reactor history: the questions in order, then drain pings and same-history re-asks.
+        Returns early when the agent stops or the history is replaced (``self.replaced``)."""
+        attempts = self.ctx["attempts"]
+        halt = lambda: self.stopped or self.replaced is not None
+        for p in todo:
+            if halt():
+                return
+            if p["question_id"] in self.final_here:  # salvaged meanwhile (a late final in this history)
                 continue
             attempts[p["question_id"]] = self.ask(hid, p, attempts.get(p["question_id"], 0))
-        if self.stopped:
+        if halt():
             return
         if self.unresolved():
             self.ping(hid, "drain late finals before re-asking timed-out questions")
         for _ in range(self.ctx["reask"]):
-            todo = self.unresolved()
-            if self.stopped or not todo:
+            pending = self.unresolved()
+            if halt() or not pending:
                 break
-            for qid, pend in todo.items():
-                if self.stopped:
+            for qid, pend in pending.items():
+                if halt():
                     return
                 if qid not in self.ctx["final"]:
                     attempts[qid] = self.ask(hid, pend["payload"], attempts.get(qid, pend["attempt"]), reask=True)
-            if not self.stopped and any(p["reask"] for p in self.unresolved().values()):
+            if not halt() and any(p["reask"] for p in self.unresolved().values()):
                 self.ping(hid, "drain late finals after re-asking")
-        if self.stopped:
+        if halt():
             return
         for qid, pend in self.unresolved().items():  # gave up waiting: the timeout stands
             self.tracker.result_event(qid, hid, pend["attempt"], pend["client"], "ambiguous", pend["wall_s"], None,
                                       final=True)
 
 
-def _stored_histories(attempts: list[dict]) -> dict[tuple[str, str], str]:
-    out: dict[tuple[str, str], str] = {}
-    for a in attempts:
-        if a.get("kind") == "new_history" and a.get("status") == "history" and a.get("reactor_history_id"):
-            out[(a["dataset_history_id"], a["agent_id"])] = a["reactor_history_id"]
-    return out
-
-
 def run(payloads: list[dict], backends: list, run_dir: Path, retry_refused: int = 3, backoff_s: float = 7.0,
         reask: int = 1, ping_text: str = "Reply only OK.", gold: dict | None = None,
-        live_meta: dict | None = None, smoke_check: bool = False) -> dict:
+        live_meta: dict | None = None, smoke_check: bool = False, max_restarts: int = 2) -> dict:
     run_dir = Path(run_dir)
     log = AttemptLog(run_dir / "attempts.jsonl")
     hashes = {p["config_hash"] for p in payloads}
@@ -309,35 +318,30 @@ def run(payloads: list[dict], backends: list, run_dir: Path, retry_refused: int 
     config_hash = next(iter(hashes)) if hashes else None
     history = log.load()
     done = {q for q, a in accepted(history, config_hash).items() if a["outcome"] in FINAL}
-    groups: dict[str, list[dict]] = {}
+    by_history: dict[str, list[dict]] = {}
     for p in payloads:
-        if p["question_id"] not in done:
-            groups.setdefault(p["dataset_history_id"], []).append(p)
+        by_history.setdefault(p["dataset_history_id"], []).append(p)
+    # each work item is a whole dataset history: a new Reactor history asks it from its first question
+    groups = {h: ps for h, ps in by_history.items() if any(p["question_id"] not in done for p in ps)}
+    pending = sum(p["question_id"] not in done for ps in groups.values() for p in ps)
     evidence_dir = run_dir / "evidence"
     evidence_dir.mkdir(parents=True, exist_ok=True)
     by_qid = {p["question_id"]: p for p in payloads}
-    timed_out: dict[str, dict[str, dict]] = {}  # Reactor history → ref → an earlier run's timeout, for salvage
-    attempts: dict[str, int] = {}
+    attempts: dict[str, int] = {}  # attempt numbers continue across runs
     for a in history:
         if a.get("kind") == "ask" and a.get("question_id") in by_qid:
             attempts[a["question_id"]] = max(attempts.get(a["question_id"], 0), a.get("attempt") or 0)
-            if a.get("outcome") == "ambiguous" and a.get("ref") and a.get("reactor_history_id"):
-                p = by_qid[a["question_id"]]
-                timed_out.setdefault(a["reactor_history_id"], {})[str(a["ref"]).lower()] = {
-                    "question_id": p["question_id"], "payload": p, "evidence_path": evidence_dir / f"{p['question_id']}.json",
-                    "attempt": a.get("attempt") or 0, "client": a.get("client") or {}, "wall_s": a.get("wall_s") or 0.0,
-                    "payload_sha": a.get("payload_sha"), "reask": False}
     run_id = uuid.uuid4().hex[:12]
-    log.append({"kind": "run_start", "run_id": run_id, "config_hash": config_hash, "pending_questions":
-                sum(map(len, groups.values())), "pending_histories": len(groups), "skipped_done": len(done),
-                "agents": [b.agent_id for b in backends], "reask": reask})
+    log.append({"kind": "run_start", "run_id": run_id, "config_hash": config_hash, "pending_questions": pending,
+                "pending_histories": len(groups), "skipped_done": len(done),
+                "agents": [b.agent_id for b in backends], "reask": reask, "max_restarts": max_restarts})
     work: queue.Queue = queue.Queue()
     for hid, ps in groups.items():
         work.put((hid, ps))
     live = LiveRun(run_dir, "reactor", {**(live_meta or {}), "config_hash": config_hash, "scheduler_run_id": run_id,
                                         "skipped_done": len(done), "histories": len(groups),
                                         "agents": [b.agent_id for b in backends]})
-    tracker = ReactorTracker(live, sum(map(len, groups.values())), gold)
+    tracker = ReactorTracker(live, pending, gold)
 
     def fallback_preview(p: dict, res: dict) -> list[str] | None:
         """Sessions the supported-citation fallback would cite for an uncited answer (export decides; this only logs)."""
@@ -347,9 +351,10 @@ def run(payloads: list[dict], backends: list, run_dir: Path, retry_refused: int 
         return citation_fallback.choose(res.get("answer") or "", {"evidence": p["evidence"]}, own)[0]
 
     ctx = {"log": log, "tracker": tracker, "run_id": run_id, "config_hash": config_hash, "evidence_dir": evidence_dir,
-           "stored": _stored_histories(history), "timed_out": timed_out, "final": set(done), "attempts": attempts,
+           "final": set(done), "attempts": attempts,
            "retry_refused": retry_refused, "backoff_s": backoff_s, "reask": reask, "ping_text": ping_text,
-           "fallback": fallback_preview, "smoke": {"enabled": smoke_check, "passed": False}, "stop_reason": []}
+           "fallback": fallback_preview, "smoke": {"enabled": smoke_check, "passed": False}, "stop_reason": [],
+           "max_restarts": max_restarts}
 
     def worker(backend):
         agent = _Agent(backend, ctx)

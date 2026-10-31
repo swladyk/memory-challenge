@@ -133,6 +133,9 @@ class ReactorConfig:
     # many times in the same Reactor history (organisers, 2026-10-31).
     reask_timed_out: int = 1
     ping_text: str = "Reply only OK."
+    # A replaced Reactor history restarts its dataset history from the first question (organisers, 2026-10-31); more
+    # replacements than this for one dataset history in a run mean another process keeps resetting the agent: stop.
+    max_history_restarts: int = 2
 
 
 @dataclass(frozen=True)

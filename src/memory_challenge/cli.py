@@ -278,8 +278,8 @@ def cmd_run_reactor(args) -> int:
         if not base or not agents:
             print("give --base-url and --agent-id (or REACTOR_BASE_URL / REACTOR_AGENT_IDS)", file=sys.stderr)
             return 2
-        backends = [ClientBackend(REPO / cfg.reactor.client_path, base, a, args.timeout or cfg.reactor.timeout_s)
-                    for a in agents]
+        backends = [ClientBackend(REPO / cfg.reactor.client_path, base, a, args.timeout or cfg.reactor.timeout_s,
+                                  request_log=run_dir / "requests.jsonl") for a in agents]
     else:
         backends = [FakeBackend(agent_id=f"agt_fake{i}") for i in range(args.fake_agents)]
     gold = None
@@ -291,7 +291,7 @@ def cmd_run_reactor(args) -> int:
                   cfg.reactor.ping_text, gold=gold,
                   live_meta={"command": "run-reactor", "backend": args.backend, "config": cfg.name,
                              "timeout_s": args.timeout or cfg.reactor.timeout_s, "reask": reask},
-                  smoke_check=args.backend == "live")
+                  smoke_check=args.backend == "live", max_restarts=cfg.reactor.max_history_restarts)
     print(json.dumps({**summary, "run_dir": str(run_dir), "backend": args.backend}, indent=1))
     return 0
 

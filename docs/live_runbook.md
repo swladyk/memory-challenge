@@ -11,8 +11,18 @@ fresh Reactor history, so latency starts low again with each one. At 60–200 s 
 answer never shows up, a re-ask. Plan **~10–15 min** for the smoke test. **The deadline is today: start the test run
 as early as possible.** An interrupted run still exports everything answered so far, and resumes where it stopped.
 
-**Only one person may use the team's agent (t05) at a time**, and every new history resets its memory. A second user
-gets `busy` refusals or takes over the history (`history_changed`; our run then stops rather than reset theirs).
+**Only one benchmark process may use the team's agent (t05) at a time**, and every new history resets its memory.
+The organisers checked t05's server logs on 2026-10-31: the agent was healthy; the `history_changed` errors came from
+overlapping history resets, "Multiple --new-history requests ... while previous chats were still active", i.e.
+concurrent scripts or teammates on the same agent. Their advice: run one benchmark process at a time, one dataset
+history after another; if a history is replaced mid-run, restart that dataset history from the beginning rather than
+retrying with the stale id. The harness does exactly that (up to `reactor.max_history_restarts` = 2 restarts per
+dataset history, then it stops instead of resetting the agent again).
+
+Nothing else may call `--new-history` during a run: not `scripts/reset_reactor_history.sh`,
+`scripts/t05_health_test.sh` or `scripts/t05_wait_until_healthy.sh`, not a second run script, the team dashboard's
+"Start a new history" or Send, `reactor/smoke_test.py`, `submission/workflow.py run` or the kit's
+`run_benchmark.py`, on this Mac or on any teammate's machine.
 
 This is runner A in `docs/integration.md`; the team-pipeline alternative (B) is at the end.
 
@@ -82,11 +92,15 @@ caffeinate -i .venv/bin/python -m memory_challenge run-reactor --payloads runs/t
 python3 -c "import json,collections; a=[json.loads(l) for l in open('runs/test-live/reactor-live/attempts.jsonl')]; print(collections.Counter(x['outcome'] for x in a if x.get('kind')=='ask'), 'asked', len({x['question_id'] for x in a if x.get('kind')=='ask'}), '/ 146')"
 ```
 
-- **Interrupted?** Run the same `run-reactor` command again (after checking t05 is still free). Questions with a
-  final answer are skipped. The history you were in continues in **its stored Reactor history** (the log keeps the
-  id), and late answers to its earlier timeouts can still be collected there. A new Reactor history is started only
-  if the server answers `history_changed` (the agent has moved on since). The reason is logged as a `new_history`
-  record in `attempts.jsonl`. Each payload carries its own evidence, so nothing needs reloading.
+- **Interrupted?** Run the same `run-reactor` command again (after checking t05 is still free), in the **same run
+  folder**. Test histories whose questions all have a final answer are skipped. Every test history with questions
+  left gets a **new** Reactor history and is asked again **from its first question**, answered ones included; a
+  Reactor history id from an earlier run is never used again (organisers, 2026-10-31: restart from the beginning
+  rather than retrying with the stale id). The newer answers replace the older ones. Each new history's reason is
+  logged as a `new_history` record in `attempts.jsonl`, and every request in `requests.jsonl`.
+- **Tracking:** `python3 tools/reactor_connection_monitor.py --out runs/test-live/connections.jsonl --enforce`
+  (another terminal, no key) logs every connection from this Mac to the Reactor server with the process that made
+  it, and stops any other Reactor tool that connects during the run.
 - **Timeouts** follow the organisers' advice. The client waits 600 s (`reactor.timeout_s`; `--timeout` to change it),
   and a timeout does not cancel the question on Reactor's side. So the run moves on to the next question. That
   request waits until the previous one has cleared, and brings back the late answer, which becomes the timed-out

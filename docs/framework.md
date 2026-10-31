@@ -194,10 +194,13 @@ What the organisers said (event channel, 2026-10-30) and how the harness follows
 | `previous_pending` right after an answer is expected; retry with a 5–10 s backoff | the client retries it within its timeout; if it still comes back, the scheduler waits `refused_backoff_s` = 7 s and retries up to `retry_refused` = 3 more times |
 | "If those labels are missing, your code can select supporting sessions from the retrieved evidence: just make sure they actually support Reactor's answer rather than blindly falling back to the top-ranked result." | `export-predictions --payloads`: supported-citation fallback (below) |
 
-- Re-running the same command resumes: questions with a final answer are skipped; a history with questions left
-  continues in its stored Reactor history, and a new one is started only on `history_changed`, with the reason logged.
-  Attempts from another configuration are never combined. A `history_changed` mid-run (someone else took the agent)
-  stops the run instead of starting a history over theirs.
+- Re-running the same command resumes: dataset histories whose questions all have a final answer are skipped; each
+  one with questions left gets a new Reactor history and is asked from its first question. A Reactor history id is
+  never retried once stale: not on resume, and not after `history_changed` mid-run, which also restarts the dataset
+  history from its first question in a new history (organisers, 2026-10-31). After `reactor.max_history_restarts`
+  (2) restarts of one dataset history the run stops, since another process keeps resetting the agent. Run one
+  benchmark process at a time. Attempts from another configuration are never combined. Live runs log every request
+  in `requests.jsonl`; `tools/reactor_connection_monitor.py` logs every connection from the machine.
 - Outcomes are kept apart: `answered`, `reactor_abstained` (INSUFFICIENT_EVIDENCE), `answered_late` (a timed-out
   question's final answer, reported with a later request in the same history; citations mapped against its own
   passages with the client's `citations()`), `ambiguous` (timeout/closed, no answer even after the ping and the

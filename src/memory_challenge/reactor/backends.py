@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -32,14 +33,44 @@ class Backend(Protocol):
 
 
 class ClientBackend:
-    def __init__(self, client_path: Path, base_url: str, agent_id: str, timeout_s: float, python: str = sys.executable):
+    """``request_log``: a JSONL file getting one line per client call (every request this process sends to Reactor):
+    action, Reactor history, question id, client pid, start/end, outcome. Never the question, answer or key."""
+
+    def __init__(self, client_path: Path, base_url: str, agent_id: str, timeout_s: float, python: str = sys.executable,
+                 request_log: Path | None = None):
         if not base_url.startswith("https://") and not base_url.startswith("http://127.0.0.1") \
                 and not base_url.startswith("http://localhost"):
             raise ValueError("base URL must be https:// (reactor/client.py:153-161)")
         self.client_path, self.base_url, self.agent_id = Path(client_path), base_url, agent_id
         self.timeout_s, self.python = timeout_s, python
+        self.request_log = Path(request_log) if request_log else None
+        self._seq = 0
+
+    def _log_request(self, record: dict) -> None:
+        if self.request_log is None:
+            return
+        self.request_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.request_log, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
     def _run(self, args: list[str]) -> dict:
+        self._seq += 1
+        action = "new-history" if "--new-history" in args else "text" if "--text" in args else "question"
+        meta = {"seq": self._seq, "action": action, "agent_id": self.agent_id,
+                "history_id": args[args.index("--history") + 1] if "--history" in args else None,
+                "question_id": args[args.index("--question-id") + 1] if "--question-id" in args else None}
+        started = time.time()
+        out = self._call(args, lambda pid: self._log_request({**meta, "event": "sent", "pid": pid,
+                                                              "ts": round(started, 3)}))
+        self._log_request({**meta, "event": "done", "ts": round(time.time(), 3), "wall_s": round(time.time() - started, 3),
+                           "status": out.get("status"), "code": out.get("code"), "exit_code": out.get("exit_code"),
+                           "retries": out.get("retries"), "new_history_id": out.get("history_id") if action == "new-history" else None,
+                           "current_history_id": out.get("current_history_id")})
+        return out
+
+    def _call(self, args: list[str], on_start) -> dict:
         cmd = [self.python, str(self.client_path), "--base-url", self.base_url, "--agent-id", self.agent_id,
                "--timeout", str(self.timeout_s), *args]
         env = os.environ.copy()
@@ -49,18 +80,22 @@ class ClientBackend:
                 env["SSL_CERT_FILE"] = certifi.where()
             except ImportError:
                 pass
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                                env=env)
+        on_start(proc.pid)
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env,
-                                  timeout=self.timeout_s + 120)
+            stdout, stderr = proc.communicate(timeout=self.timeout_s + 120)
         except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
             return {"status": "error", "error": "client process did not exit in time", "local_timeout": True}
         try:
-            out = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.stdout.strip() else None
+            out = json.loads(stdout.strip().splitlines()[-1]) if stdout.strip() else None
         except (ValueError, IndexError):
             out = None
         if not isinstance(out, dict):
             # The client never prints the key (reactor/PARTICIPANTS.md:9-10); keep only the tail of its stderr.
-            out = {"status": "error", "error": (proc.stderr or proc.stdout or "no output").strip()[-500:]}
+            out = {"status": "error", "error": (stderr or stdout or "no output").strip()[-500:]}
         out["exit_code"] = proc.returncode
         return out
 

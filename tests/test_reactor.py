@@ -91,8 +91,9 @@ class Harness(unittest.TestCase):
         run(self.payloads, [FakeBackend("agt_a", script=script)], self.root / "run")
         second = FakeBackend("agt_b")
         summary = run(self.payloads, [second], self.root / "run")
-        self.assertEqual([c for c in second.calls if c[0] == "ask"], [("ask", "q_2_job")])
-        self.assertEqual(second.histories, 1)  # agt_a's history isn't agt_b's: a new one for the history left
+        # agt_a's history isn't agt_b's: a new one for the dataset history left, asked from its first question
+        self.assertEqual([c for c in second.calls if c[0] == "ask"], [("ask", "q_2_cat"), ("ask", "q_2_job")])
+        self.assertEqual(second.histories, 1)
         self.assertEqual(summary["outcomes"].get("answered"), 6)
 
     def test_mixed_configurations_are_refused(self):
